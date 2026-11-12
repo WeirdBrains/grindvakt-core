@@ -6,6 +6,8 @@ releases one for one.
 
 ## [Unreleased]
 
+## [1.2.0] - 2026-11-12
+
 ### Added
 
 - `fs::Privacy::ServiceAccount(name)`: private to SYSTEM, Administrators and the service's
