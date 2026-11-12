@@ -5,6 +5,8 @@
 //! * [`Privacy::CurrentUser`] (the default, for apps and browsers that embed the crate): only
 //!   the account running the process can read or write it.
 //! * [`Privacy::Service`]: the rules the Grindvakt app applies to data a system service trusts.
+//! * [`Privacy::ServiceAccount`]: data a Windows service running as its own virtual account
+//!   (`NT SERVICE\<name>`) trusts. Grindvakt uses this from 1.2.0.
 //!
 //! On Unix both mean the same thing: directories `0700`, files `0600`, owned by the effective
 //! user; symlinks are refused; writes go to a temp file in the same directory, are fsynced,
@@ -17,11 +19,15 @@
 //! |---|---|---|
 //! | `CurrentUser` | current user, SYSTEM (`D:P(A;OICI;FA;;;<you>)(A;OICI;FA;;;SY)`) | you, SYSTEM, Administrators |
 //! | `Service` | SYSTEM, Administrators, LocalService (`D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;FA;;;LS)`) | SYSTEM, Administrators |
+//! | `ServiceAccount(name)` | SYSTEM, Administrators, `NT SERVICE\<name>` (`D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;FA;;;S-1-5-80-…)`) | SYSTEM, Administrators, `NT SERVICE\<name>` |
 //!
-//! An existing directory that fails the check is tightened when the policy is `CurrentUser` and
-//! its owner is one the policy accepts (like `chmod 0700` on Unix); otherwise it is refused with
-//! [`Error::InsecurePath`]. `Service` never relaxes: a directory an ordinary user owns is
-//! refused, because a service running as SYSTEM must not trust files that user can swap.
+//! An existing directory that fails the check is tightened when the policy is `CurrentUser` or
+//! `ServiceAccount` and its owner is one the policy accepts (like `chmod 0700` on Unix);
+//! otherwise it is refused with [`Error::InsecurePath`]. The service policies never trust a
+//! directory an ordinary user owns, because a service must not trust files that user can swap.
+//!
+//! [`repair_private_tree`] re-applies a policy to an existing directory and everything in it, for
+//! example to move a service's data from `Service` to `ServiceAccount` during an upgrade.
 
 macro_rules! fs_err {
     ($($t:tt)*) => { crate::fs::classify(format!($($t)*)) };
@@ -91,6 +97,77 @@ pub enum Privacy {
     /// Data a system service trusts: on Windows, SYSTEM / Administrators / LocalService only,
     /// owned by SYSTEM or Administrators. Needs an elevated or service context on Windows.
     Service,
+    /// Data a Windows service running as its virtual account `NT SERVICE\<name>` trusts:
+    /// SYSTEM, Administrators and that account only (see [`service_sid`]), owned by one of them.
+    /// Needs an elevated context or that service on Windows. On Unix it is the same as the others.
+    ServiceAccount(&'static str),
+}
+
+/// The SID of the Windows virtual service account `NT SERVICE\<name>`, as Windows derives it:
+/// `S-1-5-80-` followed by the SHA-1 of the upper-cased service name in UTF-16LE, read as five
+/// little-endian 32-bit numbers. It exists whether or not the service is installed, so data can be
+/// prepared for the account before the service is created. Available on every platform.
+pub fn service_sid(name: &str) -> String {
+    let bytes: Vec<u8> = name
+        .to_uppercase()
+        .encode_utf16()
+        .flat_map(|u| u.to_le_bytes())
+        .collect();
+    let h = sha1(&bytes);
+    let parts: Vec<String> = h
+        .chunks(4)
+        .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]).to_string())
+        .collect();
+    format!("S-1-5-80-{}", parts.join("-"))
+}
+
+/// SHA-1 (FIPS 180-4). Only used to derive service SIDs, which Windows defines with SHA-1.
+fn sha1(data: &[u8]) -> [u8; 20] {
+    let mut h: [u32; 5] = [0x67452301, 0xEFCDAB89, 0x98BADCFE, 0x10325476, 0xC3D2E1F0];
+    let mut msg = data.to_vec();
+    let bit_len = (data.len() as u64).wrapping_mul(8);
+    msg.push(0x80);
+    while msg.len() % 64 != 56 {
+        msg.push(0);
+    }
+    msg.extend_from_slice(&bit_len.to_be_bytes());
+    for block in msg.chunks(64) {
+        let mut w = [0u32; 80];
+        for (i, c) in block.chunks(4).enumerate() {
+            w[i] = u32::from_be_bytes([c[0], c[1], c[2], c[3]]);
+        }
+        for i in 16..80 {
+            w[i] = (w[i - 3] ^ w[i - 8] ^ w[i - 14] ^ w[i - 16]).rotate_left(1);
+        }
+        let [mut a, mut b, mut c, mut d, mut e] = h;
+        for (i, wi) in w.iter().enumerate() {
+            let (f, k) = match i {
+                0..=19 => ((b & c) | (!b & d), 0x5A827999),
+                20..=39 => (b ^ c ^ d, 0x6ED9EBA1),
+                40..=59 => ((b & c) | (b & d) | (c & d), 0x8F1BBCDC),
+                _ => (b ^ c ^ d, 0xCA62C1D6),
+            };
+            let t = a
+                .rotate_left(5)
+                .wrapping_add(f)
+                .wrapping_add(e)
+                .wrapping_add(k)
+                .wrapping_add(*wi);
+            e = d;
+            d = c;
+            c = b.rotate_left(30);
+            b = a;
+            a = t;
+        }
+        for (x, y) in h.iter_mut().zip([a, b, c, d, e]) {
+            *x = x.wrapping_add(y);
+        }
+    }
+    let mut out = [0u8; 20];
+    for (i, x) in h.iter().enumerate() {
+        out[i * 4..i * 4 + 4].copy_from_slice(&x.to_be_bytes());
+    }
+    out
 }
 
 #[cfg(target_os = "windows")]
@@ -209,6 +286,49 @@ pub fn ensure_private_dir_with(path: &Path, _privacy: Privacy) -> Result<()> {
     Ok(())
 }
 
+/// Re-applies `privacy` to an existing directory tree: every directory gets the private
+/// directory permissions and every file the private file permissions. Symlinks (reparse points
+/// on Windows) anywhere in the tree are refused. A missing `path` is not an error. Returns the
+/// number of entries visited.
+///
+/// On Unix every entry must be owned by the effective user; directories become `0700` and files
+/// `0600`. On Windows the tree's root must be owned by an owner the policy accepts; each entry
+/// gets the policy's protected DACL, and an entry owned by anyone else (for example LocalService,
+/// which owned files a pre-1.2 Grindvakt service created) is given to Administrators. Run it
+/// elevated (or as SYSTEM) on Windows.
+#[cfg(unix)]
+pub fn repair_private_tree(path: &Path, _privacy: Privacy) -> Result<usize> {
+    fn walk(p: &Path, n: &mut usize) -> Result<()> {
+        let md = fs::symlink_metadata(p).with_context(|| format!("lstat {}", p.display()))?;
+        if md.file_type().is_symlink() {
+            fs_bail!("refusing to operate on symlinked path {}", p.display());
+        }
+        if md.uid() != unsafe { libc::geteuid() } as u32 {
+            fs_bail!("{} not owned by current user", p.display());
+        }
+        let mode = if md.is_dir() { 0o700 } else { 0o600 };
+        fs::set_permissions(p, fs::Permissions::from_mode(mode))
+            .with_context(|| format!("chmod {mode:o} {}", p.display()))?;
+        *n += 1;
+        if md.is_dir() {
+            for e in fs::read_dir(p).with_context(|| format!("read {}", p.display()))? {
+                let e = e.with_context(|| format!("read {}", p.display()))?;
+                walk(&e.path(), n)?;
+            }
+        }
+        Ok(())
+    }
+    let Ok(md) = fs::symlink_metadata(path) else {
+        return Ok(0);
+    };
+    if !md.is_dir() && !md.file_type().is_symlink() {
+        fs_bail!("{} exists and is not a directory", path.display());
+    }
+    let mut n = 0;
+    walk(path, &mut n)?;
+    Ok(n)
+}
+
 /// Atomically replaces `dest` with `data` under `privacy`, creating a private parent directory.
 #[cfg(unix)]
 pub fn atomic_write_private_with(dest: &Path, data: &[u8], privacy: Privacy) -> Result<()> {
@@ -258,6 +378,8 @@ pub(crate) struct Policy {
     privacy: Privacy,
     /// The current user's SID in canonical SDDL form (an alias such as `LA` when one exists).
     user: String,
+    /// The virtual service account's SID for [`Privacy::ServiceAccount`].
+    service: String,
 }
 
 #[cfg(target_os = "windows")]
@@ -266,19 +388,32 @@ impl Policy {
         Ok(Self {
             privacy,
             user: current_user_sddl()?,
+            service: match privacy {
+                Privacy::ServiceAccount(name) => service_sid(name),
+                _ => String::new(),
+            },
         })
     }
     fn trustees(&self) -> Vec<&str> {
         match self.privacy {
             Privacy::Service => vec!["SY", "BA", "LS"],
+            Privacy::ServiceAccount(_) => vec!["SY", "BA", self.service.as_str()],
             Privacy::CurrentUser => vec![self.user.as_str(), "SY"],
         }
     }
     fn owners(&self) -> Vec<&str> {
         match self.privacy {
             Privacy::Service => vec!["SY", "BA"],
+            Privacy::ServiceAccount(_) => vec!["SY", "BA", self.service.as_str()],
             Privacy::CurrentUser => vec![self.user.as_str(), "SY", "BA"],
         }
+    }
+    /// Whether an existing directory with an accepted owner may be tightened to the policy.
+    fn tightens(&self) -> bool {
+        matches!(
+            self.privacy,
+            Privacy::CurrentUser | Privacy::ServiceAccount(_)
+        )
     }
     fn dir_sddl(&self) -> String {
         let aces: String = self
@@ -402,11 +537,23 @@ pub(crate) fn read_sddl(path: &Path) -> Result<String> {
 /// Replaces the DACL on `path` with the policy's protected directory DACL.
 #[cfg(target_os = "windows")]
 fn apply_dir_dacl(path: &Path, pol: &Policy) -> Result<()> {
+    apply_sddl(path, &pol.dir_sddl(), None)
+}
+
+/// Sets the DACL of `path` to `sddl` (protected) and, when `owner` is set (an SDDL owner such
+/// as `BA`), its owner too.
+#[cfg(target_os = "windows")]
+fn apply_sddl(path: &Path, sddl: &str, owner: Option<&str>) -> Result<()> {
     use windows::Win32::Security::Authorization::SetNamedSecurityInfoW;
     use windows::Win32::Security::{
-        ACL, GetSecurityDescriptorDacl, PROTECTED_DACL_SECURITY_INFORMATION, PSID,
+        ACL, GetSecurityDescriptorDacl, GetSecurityDescriptorOwner,
+        PROTECTED_DACL_SECURITY_INFORMATION, PSID,
     };
-    let sd = sd_from_sddl(&pol.dir_sddl())?;
+    let full = match owner {
+        Some(o) => format!("O:{o}{sddl}"),
+        None => sddl.to_string(),
+    };
+    let sd = sd_from_sddl(&full)?;
     let w = U16CString::from_os_str(path.as_os_str()).map_err(|_| fs_err!("bad path"))?;
     unsafe {
         let mut present = BOOL(0);
@@ -414,13 +561,18 @@ fn apply_dir_dacl(path: &Path, pol: &Policy) -> Result<()> {
         let mut dacl: *mut ACL = std::ptr::null_mut();
         GetSecurityDescriptorDacl(sd.psd, &mut present, &mut dacl, &mut defaulted)
             .map_err(|e| fs_err!("GetSecurityDescriptorDacl failed: {e}"))?;
+        let mut owner_sid = PSID::default();
+        let mut info = DACL_SECURITY_INFORMATION.0 | PROTECTED_DACL_SECURITY_INFORMATION.0;
+        if owner.is_some() {
+            GetSecurityDescriptorOwner(sd.psd, &mut owner_sid, &mut defaulted)
+                .map_err(|e| fs_err!("GetSecurityDescriptorOwner failed: {e}"))?;
+            info |= OWNER_SECURITY_INFORMATION.0;
+        }
         SetNamedSecurityInfoW(
             PCWSTR::from_raw(w.as_ptr()),
             SE_FILE_OBJECT,
-            OBJECT_SECURITY_INFORMATION(
-                DACL_SECURITY_INFORMATION.0 | PROTECTED_DACL_SECURITY_INFORMATION.0,
-            ),
-            PSID::default(),
+            OBJECT_SECURITY_INFORMATION(info),
+            owner_sid,
             PSID::default(),
             Some(dacl as *const ACL),
             None,
@@ -429,6 +581,57 @@ fn apply_dir_dacl(path: &Path, pol: &Policy) -> Result<()> {
         .map_err(|e| fs_err!("SetNamedSecurityInfoW failed on {}: {e}", path.display()))?;
     }
     Ok(())
+}
+
+/// Re-applies `privacy` to an existing directory tree. See the Unix version for the contract.
+#[cfg(target_os = "windows")]
+pub fn repair_private_tree(path: &Path, privacy: Privacy) -> Result<usize> {
+    fn walk(p: &Path, pol: &Policy, n: &mut usize) -> Result<()> {
+        let md = fs::symlink_metadata(p).with_context(|| format!("lstat {}", p.display()))?;
+        if (md.file_attributes() & 0x400) != 0 {
+            fs_bail!("refusing to operate on reparse point {}", p.display());
+        }
+        let cur = read_sddl(p)?;
+        let owner = sddl_owner(&cur).unwrap_or("");
+        let new_owner = (!pol.owners().contains(&owner)).then_some("BA");
+        let sddl = if md.is_dir() {
+            pol.dir_sddl()
+        } else {
+            pol.file_sddl()
+        };
+        apply_sddl(p, &sddl, new_owner)?;
+        *n += 1;
+        if md.is_dir() {
+            for e in fs::read_dir(p).with_context(|| format!("read {}", p.display()))? {
+                let e = e.with_context(|| format!("read {}", p.display()))?;
+                walk(&e.path(), pol, n)?;
+            }
+        }
+        Ok(())
+    }
+    let Ok(md) = fs::symlink_metadata(path) else {
+        return Ok(0);
+    };
+    if (md.file_attributes() & 0x400) != 0 {
+        fs_bail!("refusing to operate on reparse point {}", path.display());
+    }
+    if !md.is_dir() {
+        fs_bail!("{} exists and is not a directory", path.display());
+    }
+    let pol = Policy::new(privacy)?;
+    let s = read_sddl(path)?;
+    let owner = sddl_owner(&s).unwrap_or("");
+    if !pol.owners().contains(&owner) {
+        fs_bail!(
+            "insecure: {} is owned by {owner}, not {}; refusing to repair it",
+            path.display(),
+            pol.owners().join(", ")
+        );
+    }
+    let mut n = 0;
+    walk(path, &pol, &mut n)?;
+    verify_secure_acl(path, &pol).with_context(|| format!("insecure ACL on {}", path.display()))?;
+    Ok(n)
 }
 
 /// Owner field of an SDDL string such as `O:SYD:P(...)`.
@@ -514,7 +717,7 @@ fn verify_or_tighten(path: &Path, pol: &Policy) -> Result<()> {
     match verify_secure_acl(path, pol) {
         Ok(()) => Ok(()),
         Err(Error::InsecurePath(_))
-            if pol.privacy == Privacy::CurrentUser
+            if pol.tightens()
                 && read_sddl(path)
                     .ok()
                     .as_deref()
@@ -798,6 +1001,38 @@ mod tests {
         assert!(
             dest_dir.is_dir(),
             "Destination directory must remain intact"
+        );
+    }
+}
+
+#[cfg(test)]
+mod sid_tests {
+    use super::*;
+
+    #[test]
+    fn sha1_matches_known_vectors() {
+        let hex = |b: [u8; 20]| b.iter().map(|x| format!("{x:02x}")).collect::<String>();
+        assert_eq!(hex(sha1(b"")), "da39a3ee5e6b4b0d3255bfef95601890afd80709");
+        assert_eq!(
+            hex(sha1(b"abc")),
+            "a9993e364706816aba3e25717850c26c9cd0d89d"
+        );
+        assert_eq!(
+            hex(sha1(&[b'a'; 1000])),
+            "291e9a6c66994949b57ba5e650361e98fc36b1ba"
+        );
+    }
+
+    #[test]
+    fn service_sid_matches_windows() {
+        // Well-known: NT SERVICE\TrustedInstaller.
+        assert_eq!(
+            service_sid("TrustedInstaller"),
+            "S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464"
+        );
+        assert_eq!(
+            service_sid("trustedinstaller"),
+            service_sid("TrustedInstaller")
         );
     }
 }
