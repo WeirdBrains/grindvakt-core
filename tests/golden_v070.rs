@@ -1,3 +1,4 @@
+#![cfg(all(feature = "vault", feature = "standalone"))]
 //! Compatibility with files written by Grindvakt v0.7.0 (before this crate existed).
 //!
 //! `tests/fixtures/v0.7.0` was produced by the v0.7.0 code itself (test-only secrets).

@@ -1,8 +1,12 @@
-//! One sync pass: plan against the provider, then create, update or leave the record.
+//! The standalone Grindvakt app's sync pass (feature `standalone`): one `A` record from an
+//! [`AppConfig`], with the app's log lines. It is a thin wrapper over [`crate::plan()`] and
+//! [`crate::apply()`]; embedding apps usually call those directly.
 
 use crate::config::AppConfig;
 use crate::error::{Error, Result};
-use crate::provider::{DnsAction, DnsProvider};
+use crate::plan::{Change, apply, plan};
+use crate::provider::DnsProvider;
+use crate::record::{Record, RecordValue};
 use std::fmt;
 use std::net::Ipv4Addr;
 
@@ -113,37 +117,8 @@ impl fmt::Display for SyncOutcome {
     }
 }
 
-/// Plans against `provider` for `ip` and applies the result unless `mode` is
+/// Plans the config's `A` record for `ip` and applies it unless `mode` is
 /// [`SyncMode::DryRun`]. Ambiguous records give [`Error::Ambiguous`] and nothing changes.
-///
-/// ```
-/// use grindvakt_core::config::AppConfig;
-/// use grindvakt_core::provider::{DnsAction, DnsProvider};
-/// use grindvakt_core::sync::{sync_once, SyncMode, SyncOutcome};
-/// use std::net::Ipv4Addr;
-///
-/// struct Empty;
-/// impl DnsProvider for Empty {
-///     async fn plan(&self, cfg: &AppConfig, _ip: Ipv4Addr) -> grindvakt_core::Result<DnsAction> {
-///         Ok(DnsAction::Create { name: "home".into(), ttl: cfg.ttl })
-///     }
-///     async fn create_a(&self, _: &AppConfig, _: &str, _: Ipv4Addr, _: u32) -> grindvakt_core::Result<()> {
-///         unreachable!("dry run")
-///     }
-///     async fn update_a(&self, _: &AppConfig, _: u64, _: Ipv4Addr, _: u32) -> grindvakt_core::Result<()> {
-///         unreachable!("dry run")
-///     }
-/// }
-///
-/// # fn block_on<F: std::future::Future>(f: F) -> F::Output {
-/// #     tokio::runtime::Builder::new_current_thread().build().unwrap().block_on(f)
-/// # }
-/// let cfg = AppConfig { zone: "example.net".into(), name: "home".into(), ..AppConfig::default() };
-/// let ip: Ipv4Addr = "93.184.216.34".parse().unwrap();
-/// let out = block_on(sync_once(&cfg, &Empty, ip, SyncMode::DryRun)).unwrap();
-/// assert!(matches!(out, SyncOutcome::WouldCreate { .. }));
-/// assert_eq!(out.to_string(), "DRY RUN: would create A home.example.net = 93.184.216.34 (ttl=300)");
-/// ```
 pub async fn sync_once<P: DnsProvider + ?Sized>(
     cfg: &AppConfig,
     provider: &P,
@@ -151,38 +126,43 @@ pub async fn sync_once<P: DnsProvider + ?Sized>(
     mode: SyncMode,
 ) -> Result<SyncOutcome> {
     let fqdn = cfg.record_fqdn();
-    match provider.plan(cfg, ip).await? {
-        DnsAction::Noop(current) => Ok(SyncOutcome::Noop { fqdn, ip: current }),
-        DnsAction::Create { name, ttl } => {
+    let want = [Record::a(cfg.name.clone(), ip).with_ttl(cfg.ttl)];
+    let p = plan(provider, &cfg.zone, &want).await?;
+    let action = &p.actions[0];
+    let ttl = cfg.ttl;
+    let outcome = match &action.change {
+        Change::Noop => return Ok(SyncOutcome::Noop { fqdn, ip }),
+        Change::Ambiguous { reason } => return Err(Error::Ambiguous(reason.clone())),
+        Change::Create if mode == SyncMode::DryRun => SyncOutcome::WouldCreate { fqdn, ip, ttl },
+        Change::Create => SyncOutcome::Created { fqdn, ip, ttl },
+        Change::Update { id, prev, .. } => {
+            let prev = match prev {
+                RecordValue::A(p) => *p,
+                _ => unreachable!("A records plan against A records"),
+            };
             if mode == SyncMode::DryRun {
-                return Ok(SyncOutcome::WouldCreate { fqdn, ip, ttl });
-            }
-            provider.create_a(cfg, &name, ip, ttl).await?;
-            Ok(SyncOutcome::Created { fqdn, ip, ttl })
-        }
-        DnsAction::Update {
-            record_id,
-            ttl,
-            prev,
-        } => {
-            if mode == SyncMode::DryRun {
-                return Ok(SyncOutcome::WouldUpdate {
+                SyncOutcome::WouldUpdate {
                     fqdn,
                     prev,
                     ip,
                     ttl,
-                    record_id,
-                });
+                    record_id: *id,
+                }
+            } else {
+                SyncOutcome::Updated {
+                    fqdn,
+                    prev,
+                    ip,
+                    ttl,
+                    record_id: *id,
+                }
             }
-            provider.update_a(cfg, record_id, ip, ttl).await?;
-            Ok(SyncOutcome::Updated {
-                fqdn,
-                prev,
-                ip,
-                ttl,
-                record_id,
-            })
         }
-        DnsAction::Ambiguous { reason } => Err(Error::Ambiguous(reason)),
+        #[allow(unreachable_patterns)]
+        _ => return Err(Error::Ambiguous("unknown plan change".into())),
+    };
+    if mode == SyncMode::Apply {
+        apply(provider, &p).await?;
     }
+    Ok(outcome)
 }

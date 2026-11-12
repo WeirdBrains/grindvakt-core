@@ -1,19 +1,63 @@
 //! The crate's error type.
 
 use crate::config::Provider;
+use std::time::Duration;
 
 /// Everything that can go wrong in `grindvakt-core`.
 ///
-/// Messages never contain secrets (tokens, passwords, recovery words or keys).
+/// The variants are meant to be matched by a UI: [`Error::Auth`], [`Error::RateLimited`],
+/// [`Error::Ambiguous`], [`Error::NoGlobalAddress`], [`Error::Network`] and
+/// [`Error::Provider`] each call for a different message. Messages never contain secrets
+/// (tokens, passwords, recovery words or keys) or request URLs.
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum Error {
+    /// The provider rejected the token (HTTP 401/403, or an account that is not in good
+    /// standing).
+    #[error("{provider}: authentication failed: {message}")]
+    Auth {
+        /// Provider name, such as `dnsimple`.
+        provider: String,
+        /// What the provider said.
+        message: String,
+    },
+    /// The provider is throttling requests (HTTP 429).
+    #[error("{provider}: rate limited{}", .retry_after.map(|d| format!(", retry after {}s", d.as_secs())).unwrap_or_default())]
+    RateLimited {
+        /// Provider name.
+        provider: String,
+        /// How long the provider asked us to wait, when it said.
+        retry_after: Option<Duration>,
+    },
+    /// The provider or address sources could not be reached (DNS, connect, TLS, timeout).
+    #[error("network: {0}")]
+    Network(String),
+    /// A provider API call failed or returned something unexpected.
+    #[error("{provider} API: {message}")]
+    Provider {
+        /// Provider name.
+        provider: String,
+        /// What went wrong (status code or error text; never the token).
+        message: String,
+    },
+    /// Planning found records it will not guess about (for example two `A` records where
+    /// one is wanted); nothing was changed.
+    #[error("refusing to modify records: {0}")]
+    Ambiguous(String),
+    /// There is no globally routable address to publish: the sources agree on a private,
+    /// CGNAT or otherwise non-global address, or (for IPv6) there is no IPv6 connectivity.
+    /// A peer-to-peer app should fall back to relays.
+    #[error("no global address: {0}")]
+    NoGlobalAddress(String),
+    /// Address sources answered but did not agree (no strict majority).
+    #[error("address lookup: {0}")]
+    AddressLookup(String),
+    /// A record you asked for is invalid (name, TTL or TXT value).
+    #[error("invalid record: {0}")]
+    InvalidRecord(String),
     /// A configuration value is missing or out of range.
     #[error("invalid configuration: {0}")]
     Config(String),
-    /// A schedule cannot be used (bad calendar, interval too small, both or neither set).
-    #[error("invalid schedule: {0}")]
-    Schedule(String),
     /// Reading, writing or locking a file failed.
     #[error("{context}: {source}")]
     Io {
@@ -47,20 +91,6 @@ pub enum Error {
     /// A cryptographic primitive failed (for example, no system randomness).
     #[error("crypto failure: {0}")]
     Crypto(String),
-    /// A DNS provider API call failed or returned something unexpected.
-    #[error("{provider} API: {message}")]
-    Provider {
-        /// The provider that failed.
-        provider: Provider,
-        /// What went wrong (status code or error text; never the token).
-        message: String,
-    },
-    /// Sync refused to touch DNS because the current records are ambiguous.
-    #[error("refusing to modify records: {0}")]
-    Ambiguous(String),
-    /// Public IPv4 lookup failed or the sources disagreed.
-    #[error("public IPv4 lookup: {0}")]
-    PublicIp(String),
 }
 
 /// `Result` with [`Error`].
@@ -73,12 +103,25 @@ impl Error {
             source,
         }
     }
-    #[allow(dead_code)]
-    pub(crate) fn provider(provider: Provider, message: impl std::fmt::Display) -> Self {
+
+    /// A [`Error::Provider`] error, for your own [`crate::provider::DnsProvider`]s.
+    pub fn provider(provider: impl Into<String>, message: impl std::fmt::Display) -> Self {
         Error::Provider {
-            provider,
+            provider: provider.into(),
             message: message.to_string(),
         }
+    }
+
+    /// Whether retrying later could help (network trouble, throttling, provider 5xx-type
+    /// failures). Auth, ambiguity, bad input and missing addresses are not retryable.
+    pub fn is_retryable(&self) -> bool {
+        matches!(
+            self,
+            Error::Network(_)
+                | Error::RateLimited { .. }
+                | Error::Provider { .. }
+                | Error::AddressLookup(_)
+        )
     }
 }
 
@@ -91,6 +134,7 @@ impl From<std::io::Error> for Error {
     }
 }
 
+#[cfg(feature = "vault")]
 impl From<weirdnet_keys::KeysError> for Error {
     fn from(e: weirdnet_keys::KeysError) -> Self {
         match e {
@@ -101,6 +145,7 @@ impl From<weirdnet_keys::KeysError> for Error {
 }
 
 /// Attach context to `std::io::Result`.
+#[allow(dead_code)]
 pub(crate) trait IoContext<T> {
     fn ctx(self, f: impl FnOnce() -> String) -> Result<T>;
 }
