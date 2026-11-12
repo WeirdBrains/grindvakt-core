@@ -1,0 +1,54 @@
+# grindvakt-core release config for the shared WeirdBrains release script
+# (scripts/weirdnet_release.py, vendored from weirdnet-project-helpers). Release this crate first:
+# the Grindvakt app with the same version refuses to release until it is on crates.io.
+helpers = "0.2.0"
+project = "grindvakt-core"
+next = ["release Grindvakt {version}: python3 scripts/weirdnet_release.py --version {version} (in the grindvakt repo)"]
+
+[[files]]
+kind = "cargo-package"
+path = "Cargo.toml"
+primary = true
+
+[[files]]
+kind = "cargo-lock"
+path = "Cargo.lock"
+
+[changelog]
+path = "CHANGELOG.md"
+default_section = "Added"
+
+[checks]
+commands = [
+  "cargo fmt --all -- --check",
+  "cargo clippy --all-targets --all-features --locked -- -D warnings",
+  "cargo clippy --all-targets --no-default-features --locked -- -D warnings",
+  "cargo test --all-features --locked",
+  "cargo test --no-default-features --locked",
+  "for e in config_load vault_roundtrip ip_discovery dns_plan_dry_run embed_in_app; do cargo run --locked --all-features --example $e || exit 1; done",
+  "cargo package --locked --allow-dirty",
+  "cargo publish --dry-run --locked --allow-dirty",
+]
+
+[crates]
+publish = ["."]
+
+[[platforms]]
+os = "linux"
+opt_out = "a library crate published to crates.io; Grindvakt ships the installers"
+
+[[platforms]]
+os = "macos"
+opt_out = "a library crate published to crates.io; Grindvakt ships the installers"
+
+[[platforms]]
+os = "windows"
+opt_out = "a library crate published to crates.io; Grindvakt ships the installers"
+
+[[platforms]]
+os = "android"
+opt_out = "a library crate; CI builds it for Android, apps embed it"
+
+[[platforms]]
+os = "ios"
+opt_out = "a library crate; CI builds it for iOS, apps embed it"
