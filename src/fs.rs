@@ -19,7 +19,7 @@
 //! | `Service` | SYSTEM, Administrators, LocalService (`D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;FA;;;LS)`) | SYSTEM, Administrators |
 //!
 //! An existing directory that fails the check is tightened when the policy is `CurrentUser` and
-//! you own it (like `chmod 0700` on Unix); otherwise it is refused with
+//! its owner is one the policy accepts (like `chmod 0700` on Unix); otherwise it is refused with
 //! [`Error::InsecurePath`]. `Service` never relaxes: a directory an ordinary user owns is
 //! refused, because a service running as SYSTEM must not trust files that user can swap.
 
@@ -515,8 +515,11 @@ fn verify_or_tighten(path: &Path, pol: &Policy) -> Result<()> {
         Ok(()) => Ok(()),
         Err(Error::InsecurePath(_))
             if pol.privacy == Privacy::CurrentUser
-                && read_sddl(path).ok().as_deref().and_then(sddl_owner)
-                    == Some(pol.user.as_str()) =>
+                && read_sddl(path)
+                    .ok()
+                    .as_deref()
+                    .and_then(sddl_owner)
+                    .is_some_and(|o| pol.owners().contains(&o)) =>
         {
             apply_dir_dacl(path, pol)?;
             verify_secure_acl(path, pol)
