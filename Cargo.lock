@@ -885,7 +885,7 @@ dependencies = [
 
 [[package]]
 name = "grindvakt-core"
-version = "1.1.4"
+version = "1.2.0"
 dependencies = [
  "assert_fs",
  "base64 0.21.7",
