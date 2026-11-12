@@ -1,6 +1,6 @@
 [package]
 name = "grindvakt-core"
-version = "1.1.0"
+version = "1.1.1"
 edition = "2024"
 rust-version = "1.99"
 description = "The Grindvakt dynamic DNS engine as a library: keep A, AAAA, TXT (including libp2p _dnsaddr) and CNAME records current on DNSimple or DigitalOcean. Separate IPv4/IPv6 discovery that reports when there is no global address, a plan/apply split with dry runs, a provider trait and typed errors. Caller-owned secrets and paths, no CLI, no prompts, no scheduler. Optional encrypted token vault."
