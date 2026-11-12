@@ -6,6 +6,10 @@ on:
     tags: ['v*']
   workflow_dispatch:
 
+# Read-only token everywhere; no job writes to the repo.
+permissions:
+  contents: read
+
 env:
   CARGO_TERM_COLOR: always
 
@@ -18,10 +22,14 @@ jobs:
       matrix:
         os: [ubuntu-latest, macos-15, windows-2022]
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          components: rustfmt, clippy
+          persist-credentials: false
+      - name: Rust stable with rustfmt and clippy
+        shell: bash
+        run: |
+          rustup toolchain install stable --profile minimal --component rustfmt --component clippy
+          rustup default stable
       - name: fmt
         run: cargo fmt --all -- --check
       - name: clippy (all features)
@@ -51,10 +59,13 @@ jobs:
   android:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          targets: aarch64-linux-android, x86_64-linux-android
+          persist-credentials: false
+      - name: Rust stable with Android targets
+        run: |
+          rustup toolchain install stable --profile minimal --target aarch64-linux-android --target x86_64-linux-android
+          rustup default stable
       - name: cargo check (Android, NDK clang)
         shell: bash
         run: |
@@ -71,10 +82,13 @@ jobs:
   ios:
     runs-on: macos-15
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          targets: aarch64-apple-ios, aarch64-apple-ios-sim
+          persist-credentials: false
+      - name: Rust stable with iOS targets
+        run: |
+          rustup toolchain install stable --profile minimal --target aarch64-apple-ios --target aarch64-apple-ios-sim
+          rustup default stable
       - name: cargo check (iOS)
         run: |
           for t in aarch64-apple-ios aarch64-apple-ios-sim; do
@@ -85,16 +99,26 @@ jobs:
   msrv:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@1.99
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Rust 1.99 (MSRV)
+        run: |
+          rustup toolchain install 1.99 --profile minimal
+          rustup default 1.99
       - run: cargo check --all-features --locked
       - run: cargo check --no-default-features --locked
 
   docs:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@nightly
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Rust nightly (docs.rs)
+        run: |
+          rustup toolchain install nightly --profile minimal
+          rustup default nightly
       - name: docs.rs build
         env:
           RUSTDOCFLAGS: --cfg docsrs -D warnings
