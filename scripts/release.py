@@ -128,12 +128,15 @@ def main() -> None:
     if run("git", "status", "--porcelain", capture=True).strip():
         run("git", "commit", "-m", f"release: {tag}")
     run("git", "tag", "-a", tag, "-m", f"{CRATE} {v}")
-    run("git", "push", "--atomic", "origin", "HEAD:refs/heads/main", f"refs/tags/{tag}")
-    run("cargo", "publish", "--locked")
-
+    # Package the committed tree (not the dirty pre-commit one) to know the checksum
+    # crates.io must report; packaging is reproducible for a given commit.
+    run("cargo", "package", "--locked", "--no-verify")
     target_dir = json.loads(run("cargo", "metadata", "--format-version", "1", "--no-deps", capture=True))["target_directory"]
     crate_file = Path(target_dir) / "package" / f"{CRATE}-{v}.crate"
     local = hashlib.sha256(crate_file.read_bytes()).hexdigest()
+    run("git", "push", "--atomic", "origin", "HEAD:refs/heads/main", f"refs/tags/{tag}")
+    run("cargo", "publish", "--locked")
+
     for _ in range(60):
         live = crates_io_versions().get(v)
         if live:
