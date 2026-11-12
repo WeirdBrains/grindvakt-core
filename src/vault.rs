@@ -40,7 +40,7 @@
 
 use crate::config::Provider;
 use crate::error::{Error, IoContext, Result};
-use crate::fs::atomic_write_private;
+use crate::fs::{Privacy, atomic_write_private_with};
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as B64;
 use secrecy::{ExposeSecret, SecretString};
@@ -410,9 +410,16 @@ impl Vault {
         Self::from_json(&text)
     }
 
-    /// Writes the vault atomically with owner-only permissions.
+    /// Writes the vault atomically, private to the current user
+    /// (see [`crate::fs::atomic_write_private`]).
     pub fn save(&self, path: &Path) -> Result<()> {
-        atomic_write_private(path, self.to_json().as_bytes())
+        self.save_with(path, Privacy::CurrentUser)
+    }
+
+    /// [`Vault::save`] under an explicit [`Privacy`] policy, such as
+    /// [`Privacy::Service`] for a vault a system service unlocks.
+    pub fn save_with(&self, path: &Path, privacy: Privacy) -> Result<()> {
+        atomic_write_private_with(path, self.to_json().as_bytes(), privacy)
     }
 
     /// The on-disk structure.

@@ -1,16 +1,27 @@
 //! Private directories and atomic private file writes.
 //!
-//! * Unix: directories `0700`, files `0600`, owned by the current user; symlinks are refused;
-//!   writes go to a temp file in the same directory, are fsynced, renamed into place, and the
-//!   directory is fsynced.
-//! * Windows: directories get a protected DACL that allows only SYSTEM, Administrators and
-//!   LocalService (`D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;FA;;;LS)`), and existing
-//!   directories are verified against it; reparse points are refused; writes use an exclusive
-//!   temp file with the same DACL and `MoveFileExW(REPLACE_EXISTING | WRITE_THROUGH)`.
+//! Every function takes (or defaults) a [`Privacy`] that says *who* the data is private to:
 //!
-//! These are the rules the Grindvakt app has always applied to `~/.grindvakt` and
-//! `%PROGRAMDATA%\Grindvakt`. On Windows they assume an elevated or service context, so a
-//! directory owned by an ordinary user is rejected.
+//! * [`Privacy::CurrentUser`] (the default, for apps and browsers that embed the crate): only
+//!   the account running the process can read or write it.
+//! * [`Privacy::Service`]: the rules the Grindvakt app applies to data a system service trusts.
+//!
+//! On Unix both mean the same thing: directories `0700`, files `0600`, owned by the effective
+//! user; symlinks are refused; writes go to a temp file in the same directory, are fsynced,
+//! renamed into place, and the directory is fsynced.
+//!
+//! On Windows reparse points are refused, writes use an exclusive temp file and
+//! `MoveFileExW(REPLACE_EXISTING | WRITE_THROUGH)`, and the DACL depends on the policy:
+//!
+//! | Policy | Directory DACL (protected, inherited by files) | Accepted owners |
+//! |---|---|---|
+//! | `CurrentUser` | current user, SYSTEM (`D:P(A;OICI;FA;;;<you>)(A;OICI;FA;;;SY)`) | you, SYSTEM, Administrators |
+//! | `Service` | SYSTEM, Administrators, LocalService (`D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;FA;;;LS)`) | SYSTEM, Administrators |
+//!
+//! An existing directory that fails the check is tightened when the policy is `CurrentUser` and
+//! you own it (like `chmod 0700` on Unix); otherwise it is refused with
+//! [`Error::InsecurePath`]. `Service` never relaxes: a directory an ordinary user owns is
+//! refused, because a service running as SYSTEM must not trust files that user can swap.
 
 macro_rules! fs_err {
     ($($t:tt)*) => { crate::fs::classify(format!($($t)*)) };
@@ -69,6 +80,18 @@ use std::path::Path;
 
 #[cfg(unix)]
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+/// Who a private directory or file is private to. See the [module docs](self).
+#[non_exhaustive]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum Privacy {
+    /// Only the account running this process (plus SYSTEM on Windows). The default.
+    #[default]
+    CurrentUser,
+    /// Data a system service trusts: on Windows, SYSTEM / Administrators / LocalService only,
+    /// owned by SYSTEM or Administrators. Needs an elevated or service context on Windows.
+    Service,
+}
 
 #[cfg(target_os = "windows")]
 use std::ffi::OsStr;
@@ -138,9 +161,22 @@ impl Drop for TempFileGuard {
     }
 }
 
-/// Creates `path` (and parents) as a private directory, or checks and tightens an existing one.
-#[cfg(unix)]
+/// Creates `path` (and parents) as a directory private to the current user, or checks and
+/// tightens an existing one. Same as [`ensure_private_dir_with`] with [`Privacy::CurrentUser`].
 pub fn ensure_private_dir(path: &Path) -> Result<()> {
+    ensure_private_dir_with(path, Privacy::CurrentUser)
+}
+
+/// Atomically replaces `dest` with `data`, private to the current user, creating a private
+/// parent directory. Same as [`atomic_write_private_with`] with [`Privacy::CurrentUser`].
+pub fn atomic_write_private(dest: &Path, data: &[u8]) -> Result<()> {
+    atomic_write_private_with(dest, data, Privacy::CurrentUser)
+}
+
+/// Creates `path` (and parents) as a private directory under `privacy`, or checks (and where
+/// allowed tightens) an existing one.
+#[cfg(unix)]
+pub fn ensure_private_dir_with(path: &Path, _privacy: Privacy) -> Result<()> {
     // Refuse to follow symlinks
     if path.exists() {
         let lmd =
@@ -173,14 +209,14 @@ pub fn ensure_private_dir(path: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Atomically replaces `dest` with `data`, owner-only, creating a private parent directory.
+/// Atomically replaces `dest` with `data` under `privacy`, creating a private parent directory.
 #[cfg(unix)]
-pub fn atomic_write_private(dest: &Path, data: &[u8]) -> Result<()> {
+pub fn atomic_write_private_with(dest: &Path, data: &[u8], privacy: Privacy) -> Result<()> {
     use tempfile::NamedTempFile;
     let parent = dest
         .parent()
         .ok_or_else(|| fs_err!("no parent for {}", dest.display()))?;
-    ensure_private_dir(parent)?;
+    ensure_private_dir_with(parent, privacy)?;
     // Refuse to write through symlink destination
     if dest.exists() {
         let lmd =
@@ -216,9 +252,206 @@ pub fn atomic_write_private(dest: &Path, data: &[u8]) -> Result<()> {
     Ok(())
 }
 
-/// Creates `path` (and parents) with the protected Grindvakt DACL, or verifies an existing one.
+/// What a [`Privacy`] means on Windows for this process.
 #[cfg(target_os = "windows")]
-pub fn ensure_private_dir(path: &Path) -> Result<()> {
+pub(crate) struct Policy {
+    privacy: Privacy,
+    /// The current user's SID in canonical SDDL form (an alias such as `LA` when one exists).
+    user: String,
+}
+
+#[cfg(target_os = "windows")]
+impl Policy {
+    pub(crate) fn new(privacy: Privacy) -> Result<Self> {
+        Ok(Self {
+            privacy,
+            user: current_user_sddl()?,
+        })
+    }
+    fn trustees(&self) -> Vec<&str> {
+        match self.privacy {
+            Privacy::Service => vec!["SY", "BA", "LS"],
+            Privacy::CurrentUser => vec![self.user.as_str(), "SY"],
+        }
+    }
+    fn owners(&self) -> Vec<&str> {
+        match self.privacy {
+            Privacy::Service => vec!["SY", "BA"],
+            Privacy::CurrentUser => vec![self.user.as_str(), "SY", "BA"],
+        }
+    }
+    fn dir_sddl(&self) -> String {
+        let aces: String = self
+            .trustees()
+            .iter()
+            .map(|t| format!("(A;OICI;FA;;;{t})"))
+            .collect();
+        format!("D:P{aces}")
+    }
+    pub(crate) fn file_sddl(&self) -> String {
+        let aces: String = self
+            .trustees()
+            .iter()
+            .map(|t| format!("(A;;FA;;;{t})"))
+            .collect();
+        format!("D:P{aces}")
+    }
+}
+
+/// A security descriptor parsed from SDDL, freed on drop.
+#[cfg(target_os = "windows")]
+fn sd_from_sddl(sddl: &str) -> Result<PsdGuard> {
+    let w = U16CString::from_str(sddl).map_err(|_| fs_err!("bad SDDL string"))?;
+    let mut psd = PSECURITY_DESCRIPTOR::default();
+    unsafe {
+        ConvertStringSecurityDescriptorToSecurityDescriptorW(
+            PCWSTR::from_raw(w.as_ptr()),
+            SDDL_REVISION_1,
+            &mut psd as *mut _ as *mut _,
+            None,
+        )
+        .map_err(|e| fs_err!("ConvertStringSecurityDescriptorToSecurityDescriptorW failed: {e}"))?;
+    }
+    Ok(PsdGuard { psd })
+}
+
+/// SDDL text for the owner and DACL of `psd`, without the trailing NUL.
+#[cfg(target_os = "windows")]
+unsafe fn sddl_of(psd: PSECURITY_DESCRIPTOR, info: OBJECT_SECURITY_INFORMATION) -> Result<String> {
+    let mut sddl_ptr = windows::core::PWSTR::null();
+    let mut sddl_len: u32 = 0;
+    unsafe {
+        ConvertSecurityDescriptorToStringSecurityDescriptorW(
+            psd,
+            SDDL_REVISION_1,
+            info,
+            &mut sddl_ptr,
+            Some(&mut sddl_len),
+        )
+        .map_err(|e| fs_err!("ConvertSecurityDescriptorToStringSecurityDescriptorW failed: {e}"))?;
+        let slice = std::slice::from_raw_parts(sddl_ptr.0, sddl_len as usize);
+        let s = String::from_utf16_lossy(slice);
+        let _ = LocalFree(HLOCAL(sddl_ptr.0 as *mut core::ffi::c_void));
+        Ok(s.trim_end_matches('\0').to_string())
+    }
+}
+
+/// The current process user's SID as SDDL shows it in an owner field.
+#[cfg(target_os = "windows")]
+fn current_user_sddl() -> Result<String> {
+    use windows::Win32::Foundation::{CloseHandle, HANDLE};
+    use windows::Win32::Security::Authorization::ConvertSidToStringSidW;
+    use windows::Win32::Security::{GetTokenInformation, TOKEN_QUERY, TOKEN_USER, TokenUser};
+    use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+    unsafe {
+        let mut token = HANDLE::default();
+        OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token)
+            .map_err(|e| fs_err!("OpenProcessToken failed: {e}"))?;
+        let mut len = 0u32;
+        let _ = GetTokenInformation(token, TokenUser, None, 0, &mut len);
+        let mut buf = vec![0u64; (len as usize).div_ceil(8).max(1)];
+        let got = GetTokenInformation(
+            token,
+            TokenUser,
+            Some(buf.as_mut_ptr() as *mut core::ffi::c_void),
+            len,
+            &mut len,
+        );
+        let _ = CloseHandle(token);
+        got.map_err(|e| fs_err!("GetTokenInformation failed: {e}"))?;
+        let tu = &*(buf.as_ptr() as *const TOKEN_USER);
+        let mut p = windows::core::PWSTR::null();
+        ConvertSidToStringSidW(tu.User.Sid, &mut p)
+            .map_err(|e| fs_err!("ConvertSidToStringSidW failed: {e}"))?;
+        let sid = p.to_string().map_err(|_| fs_err!("SID is not UTF-16"));
+        let _ = LocalFree(HLOCAL(p.0 as *mut core::ffi::c_void));
+        let sid = sid?;
+        // Round-trip through a descriptor so the text matches what GetNamedSecurityInfoW reports
+        // (well-known accounts come back as aliases such as `LA` or `SY`).
+        let sd = sd_from_sddl(&format!("O:{sid}"))?;
+        let canon = sddl_of(sd.psd, OWNER_SECURITY_INFORMATION)?;
+        Ok(canon.strip_prefix("O:").unwrap_or(&canon).to_string())
+    }
+}
+
+/// Owner and DACL of `path` as SDDL text.
+#[cfg(target_os = "windows")]
+pub(crate) fn read_sddl(path: &Path) -> Result<String> {
+    let w = U16CString::from_os_str(path.as_os_str()).map_err(|_| fs_err!("bad path"))?;
+    let info =
+        OBJECT_SECURITY_INFORMATION(DACL_SECURITY_INFORMATION.0 | OWNER_SECURITY_INFORMATION.0);
+    unsafe {
+        let mut psd = PSECURITY_DESCRIPTOR::default();
+        GetNamedSecurityInfoW(
+            PCWSTR::from_raw(w.as_ptr()),
+            SE_OBJECT_TYPE(SE_FILE_OBJECT.0),
+            info,
+            None,
+            None,
+            None,
+            None,
+            &mut psd as *mut _ as *mut _,
+        )
+        .ok()
+        .map_err(|e| fs_err!("GetNamedSecurityInfoW failed: {e}"))?;
+        let guard = PsdGuard { psd };
+        sddl_of(guard.psd, info)
+    }
+}
+
+/// Replaces the DACL on `path` with the policy's protected directory DACL.
+#[cfg(target_os = "windows")]
+fn apply_dir_dacl(path: &Path, pol: &Policy) -> Result<()> {
+    use windows::Win32::Security::Authorization::SetNamedSecurityInfoW;
+    use windows::Win32::Security::{
+        ACL, GetSecurityDescriptorDacl, PROTECTED_DACL_SECURITY_INFORMATION, PSID,
+    };
+    let sd = sd_from_sddl(&pol.dir_sddl())?;
+    let w = U16CString::from_os_str(path.as_os_str()).map_err(|_| fs_err!("bad path"))?;
+    unsafe {
+        let mut present = BOOL(0);
+        let mut defaulted = BOOL(0);
+        let mut dacl: *mut ACL = std::ptr::null_mut();
+        GetSecurityDescriptorDacl(sd.psd, &mut present, &mut dacl, &mut defaulted)
+            .map_err(|e| fs_err!("GetSecurityDescriptorDacl failed: {e}"))?;
+        SetNamedSecurityInfoW(
+            PCWSTR::from_raw(w.as_ptr()),
+            SE_FILE_OBJECT,
+            OBJECT_SECURITY_INFORMATION(
+                DACL_SECURITY_INFORMATION.0 | PROTECTED_DACL_SECURITY_INFORMATION.0,
+            ),
+            PSID::default(),
+            PSID::default(),
+            Some(dacl as *const ACL),
+            None,
+        )
+        .ok()
+        .map_err(|e| fs_err!("SetNamedSecurityInfoW failed on {}: {e}", path.display()))?;
+    }
+    Ok(())
+}
+
+/// Owner field of an SDDL string such as `O:SYD:P(...)`.
+#[cfg(target_os = "windows")]
+fn sddl_owner(s: &str) -> Option<&str> {
+    let rest = s.strip_prefix("O:")?;
+    let end = rest
+        .find("G:")
+        .or_else(|| rest.find("D:"))
+        .unwrap_or(rest.len());
+    Some(&rest[..end])
+}
+
+/// Creates `path` (and parents) with the policy's protected DACL, or verifies (and for
+/// [`Privacy::CurrentUser`] tightens) an existing directory.
+#[cfg(target_os = "windows")]
+pub fn ensure_private_dir_with(path: &Path, privacy: Privacy) -> Result<()> {
+    let pol = Policy::new(privacy)?;
+    ensure_dir_policy(path, &pol)
+}
+
+#[cfg(target_os = "windows")]
+fn ensure_dir_policy(path: &Path, pol: &Policy) -> Result<()> {
     // Reject reparse points on the path itself
     if path.exists() {
         let md = fs::symlink_metadata(path).with_context(|| format!("lstat {}", path.display()))?;
@@ -229,9 +462,7 @@ pub fn ensure_private_dir(path: &Path) -> Result<()> {
         if !md.is_dir() {
             fs_bail!("{} exists and is not a directory", path.display());
         }
-        // Validate existing ACL is secure; fail closed if not.
-        verify_secure_acl(path).with_context(|| format!("insecure ACL on {}", path.display()))?;
-        return Ok(());
+        return verify_or_tighten(path, pol);
     }
     // Validate that no ancestor (up to root) is a reparse/junction
     for ancestor in path.ancestors() {
@@ -253,51 +484,56 @@ pub fn ensure_private_dir(path: &Path) -> Result<()> {
         .parent()
         .ok_or_else(|| fs_err!("no parent for {}", path.display()))?;
     if !parent.exists() {
-        ensure_private_dir(parent)?; // recurse upward first
+        ensure_dir_policy(parent, pol)?; // recurse upward first
     }
-    // Build restrictive inheritable DACL: SYSTEM/Administrators full; LOCAL SERVICE full; no Users.
-    // OI|CI to propagate to files/subdirs.
-    let sddl = "D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;FA;;;LS)";
-    unsafe {
-        let mut psd: PSECURITY_DESCRIPTOR = PSECURITY_DESCRIPTOR::default();
-        ConvertStringSecurityDescriptorToSecurityDescriptorW(
-            PCWSTR::from_raw(U16CString::from_str(sddl).unwrap().as_ptr()),
-            SDDL_REVISION_1,
-            &mut psd as *mut _ as *mut _,
-            None,
-        )
-        .map_err(|e| fs_err!("ConvertStringSecurityDescriptorToSecurityDescriptorW failed: {e}"))?;
-        let _psd_guard = PsdGuard { psd };
-        let sa = SECURITY_ATTRIBUTES {
-            lpSecurityDescriptor: psd.0,
-            nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
-            bInheritHandle: BOOL(0),
-        };
-        let ok2 = CreateDirectoryW(
-            PCWSTR::from_raw(U16CString::from_os_str(path.as_os_str()).unwrap().as_ptr()),
+    // Protected, inheritable (OI|CI) DACL for the policy's trustees only.
+    let sd = sd_from_sddl(&pol.dir_sddl())?;
+    let sa = SECURITY_ATTRIBUTES {
+        lpSecurityDescriptor: sd.psd.0,
+        nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
+        bInheritHandle: BOOL(0),
+    };
+    let w = U16CString::from_os_str(path.as_os_str()).map_err(|_| fs_err!("bad path"))?;
+    if let Err(e) = unsafe {
+        CreateDirectoryW(
+            PCWSTR::from_raw(w.as_ptr()),
             Some(&sa as *const SECURITY_ATTRIBUTES),
-        );
-        if let Err(e) = ok2 {
-            // If already exists, that's fine; otherwise error
-            if !path.exists() {
-                fs_bail!("failed to create directory {}: {}", path.display(), e);
-            }
+        )
+    } {
+        // If already exists (a racing creator), it is verified below; otherwise error
+        if !path.exists() {
+            fs_bail!("failed to create directory {}: {}", path.display(), e);
         }
     }
-    // Always verify target ACL after creation (or if pre-existed)
-    verify_secure_acl(path).with_context(|| format!("insecure ACL on {}", path.display()))?;
-    Ok(())
+    // Always verify target ACL after creation (or if a racer created it)
+    verify_secure_acl(path, pol).with_context(|| format!("insecure ACL on {}", path.display()))
 }
 
-/// Atomically replaces `dest` with `data` under the protected Grindvakt DACL.
 #[cfg(target_os = "windows")]
-pub fn atomic_write_private(dest: &Path, data: &[u8]) -> Result<()> {
-    // no direct FlushFileBuffers; use File::sync_all()
+fn verify_or_tighten(path: &Path, pol: &Policy) -> Result<()> {
+    match verify_secure_acl(path, pol) {
+        Ok(()) => Ok(()),
+        Err(Error::InsecurePath(_))
+            if pol.privacy == Privacy::CurrentUser
+                && read_sddl(path).ok().as_deref().and_then(sddl_owner)
+                    == Some(pol.user.as_str()) =>
+        {
+            apply_dir_dacl(path, pol)?;
+            verify_secure_acl(path, pol)
+                .with_context(|| format!("insecure ACL on {}", path.display()))
+        }
+        Err(e) => Err(e).with_context(|| format!("insecure ACL on {}", path.display())),
+    }
+}
 
+/// Atomically replaces `dest` with `data` under `privacy`'s protected DACL.
+#[cfg(target_os = "windows")]
+pub fn atomic_write_private_with(dest: &Path, data: &[u8], privacy: Privacy) -> Result<()> {
+    let pol = Policy::new(privacy)?;
     let parent = dest
         .parent()
         .ok_or_else(|| fs_err!("no parent for {}", dest.display()))?;
-    ensure_private_dir(parent)?;
+    ensure_dir_policy(parent, &pol)?;
     // Refuse to write through symlink/reparse destination
     if dest.exists() {
         let md = fs::symlink_metadata(dest).with_context(|| format!("lstat {}", dest.display()))?;
@@ -311,43 +547,31 @@ pub fn atomic_write_private(dest: &Path, data: &[u8]) -> Result<()> {
     // Temp file in same directory, created with exclusive CREATE_NEW and restrictive DACL
     let tmp_name = format!(".{}.tmp", uuid::Uuid::new_v4().as_simple());
     let tmp_path = parent.join(tmp_name);
-    // Delegate core behavior to internal helper to ensure tests exercise identical code paths.
-    atomic_write_private_with_tmp(dest, &tmp_path, data)?;
+    atomic_write_private_with_tmp(dest, &tmp_path, data, &pol.file_sddl())?;
     // Verify parent directory ACL after write (handles already-exist winner case too)
-    verify_secure_acl(dest.parent().unwrap())?;
-    Ok(())
+    verify_secure_acl(parent, &pol)
 }
 
 // Windows internal helper used by production and tests: perform atomic write using an explicit
-// temp path within the same directory. Security descriptor, exclusive create, and guarded
+// temp path within the same directory and the given file SDDL. Exclusive create and guarded
 // cleanup are identical to production behavior. This function does not call verify_secure_acl.
 #[cfg(target_os = "windows")]
 pub(crate) fn atomic_write_private_with_tmp(
     dest: &Path,
     tmp_path: &Path,
     data: &[u8],
+    file_sddl: &str,
 ) -> Result<()> {
-    // Build restrictive inheritable DACL for temp file; allow LocalService full control for atomic replace.
-    let sddl = "D:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;FA;;;LS)";
     let to_w = |s: &OsStr| -> Vec<u16> { s.encode_wide().chain(std::iter::once(0)).collect() };
+    let sd = sd_from_sddl(file_sddl)?;
+    let sa = SECURITY_ATTRIBUTES {
+        lpSecurityDescriptor: sd.psd.0,
+        nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
+        bInheritHandle: BOOL(0),
+    };
+    let tmp_w = to_w(tmp_path.as_os_str());
+    let dest_w = to_w(dest.as_os_str());
     unsafe {
-        let mut psd: PSECURITY_DESCRIPTOR = PSECURITY_DESCRIPTOR::default();
-        ConvertStringSecurityDescriptorToSecurityDescriptorW(
-            PCWSTR::from_raw(U16CString::from_str(sddl).unwrap().as_ptr()),
-            SDDL_REVISION_1,
-            &mut psd as *mut _ as *mut _,
-            None,
-        )
-        .map_err(|e| fs_err!("ConvertStringSecurityDescriptorToSecurityDescriptorW failed: {e}"))?;
-        let _psd_guard = PsdGuard { psd };
-        let sa = SECURITY_ATTRIBUTES {
-            lpSecurityDescriptor: psd.0,
-            nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
-            bInheritHandle: BOOL(0),
-        };
-        // Ensure temp cleanup even on early errors; guard drops after file is closed (declared before file)
-        let tmp_w = to_w(tmp_path.as_os_str());
-        let dest_w = to_w(dest.as_os_str());
         let handle = match CreateFileW(
             PCWSTR::from_raw(tmp_w.as_ptr()),
             FILE_GENERIC_READ.0 | FILE_GENERIC_WRITE.0,
@@ -362,8 +586,8 @@ pub(crate) fn atomic_write_private_with_tmp(
                 fs_bail!("create tmp {}: {}", tmp_path.display(), e);
             }
         };
+        // Armed only after our exclusive create succeeded, so a collision never deletes a file.
         let mut tmp_guard = TempFileGuard::new(tmp_path.to_path_buf());
-        // Convert to std::fs::File and write
         let mut file = std::fs::File::from_raw_handle(handle.0 as _);
         if let Err(e) = (|| -> Result<()> {
             file.write_all(data)?;
@@ -375,79 +599,41 @@ pub(crate) fn atomic_write_private_with_tmp(
             return Err(e);
         }
         drop(file); // ensure handle closed before rename
-        // Move into place atomically
         MoveFileExW(
             PCWSTR::from_raw(tmp_w.as_ptr()),
             PCWSTR::from_raw(dest_w.as_ptr()),
             MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
         )
-        .map_err(|e| {
-            // Best-effort cleanup happens via guard drop
-            fs_err!("rename {} -> {}: {}", tmp_path.display(), dest.display(), e)
-        })?;
-        // Disarm cleanup guard on success
+        .map_err(|e| fs_err!("rename {} -> {}: {}", tmp_path.display(), dest.display(), e))?;
         tmp_guard.disarm();
     }
     Ok(())
 }
 
+/// Checks that `path` has a protected DACL naming only the policy's trustees and an accepted owner.
 #[cfg(target_os = "windows")]
-fn verify_secure_acl(path: &Path) -> Result<()> {
-    unsafe {
-        let mut psecuritydescriptor: PSECURITY_DESCRIPTOR = PSECURITY_DESCRIPTOR::default();
-        let status = GetNamedSecurityInfoW(
-            PCWSTR::from_raw(U16CString::from_os_str(path.as_os_str()).unwrap().as_ptr()),
-            SE_OBJECT_TYPE(SE_FILE_OBJECT.0),
-            OBJECT_SECURITY_INFORMATION(DACL_SECURITY_INFORMATION.0 | OWNER_SECURITY_INFORMATION.0),
-            None,
-            None,
-            None,
-            None,
-            &mut psecuritydescriptor as *mut _ as *mut _,
+pub(crate) fn verify_secure_acl(path: &Path, pol: &Policy) -> Result<()> {
+    let s = read_sddl(path)?;
+    if !s.contains("D:P") {
+        fs_bail!("DACL not protected (requires D:P): {}", s);
+    }
+    let owner = sddl_owner(&s).unwrap_or("");
+    if !pol.owners().contains(&owner) {
+        fs_bail!(
+            "Owner {} not allowed (allowed: {}): {}",
+            owner,
+            pol.owners().join(", "),
+            s
         );
-        status
-            .ok()
-            .map_err(|e| fs_err!("GetNamedSecurityInfoW failed: {e}"))?;
-        let mut sddl_ptr: windows::core::PWSTR = windows::core::PWSTR::null();
-        let mut sddl_len: u32 = 0;
-        ConvertSecurityDescriptorToStringSecurityDescriptorW(
-            psecuritydescriptor,
-            SDDL_REVISION_1,
-            OBJECT_SECURITY_INFORMATION(DACL_SECURITY_INFORMATION.0 | OWNER_SECURITY_INFORMATION.0),
-            &mut sddl_ptr,
-            Some(&mut sddl_len),
-        )
-        .map_err(|e| {
-            let _ = LocalFree(HLOCAL(psecuritydescriptor.0));
-            fs_err!("ConvertSecurityDescriptorToStringSecurityDescriptorW failed: {e}")
-        })?;
-        let s = {
-            let slice = std::slice::from_raw_parts(sddl_ptr.0, sddl_len as usize);
-            String::from_utf16_lossy(slice)
-        };
-        let _ = LocalFree(HLOCAL(sddl_ptr.0 as *mut core::ffi::c_void));
-        let _ = LocalFree(HLOCAL(psecuritydescriptor.0));
-        // Must be protected DACL (D:P...), owner SYSTEM or Administrators, and allowlist ACEs only for SY/BA/LS.
-        if !s.contains("D:P") {
-            fs_bail!("DACL not protected (requires D:P): {}", s);
-        }
-        if !(s.contains("O:SY") || s.contains("O:BA")) {
-            fs_bail!("Owner must be SYSTEM or Administrators: {}", s);
-        }
-        // Extract ACE entries inside D:(...)
-        if let Some(d_start) = s.find("D:") {
-            let d = &s[d_start + 2..];
-            for seg in d.split('(').skip(1) {
-                if let Some(end) = seg.find(')') {
-                    let ace = &seg[..end];
-                    // Expect A;...;;;SID
-                    if let Some(sid) = ace.rsplit(';').next() {
-                        let sid = sid.trim();
-                        if !(sid == "SY" || sid == "BA" || sid == "LS") {
-                            fs_bail!("unexpected SID in DACL: {}", sid);
-                        }
-                    }
-                }
+    }
+    if let Some(d_start) = s.find("D:") {
+        let trustees = pol.trustees();
+        for seg in s[d_start + 2..].split('(').skip(1) {
+            if let Some(end) = seg.find(')')
+                && let Some(sid) = seg[..end].rsplit(';').next()
+                && !trustees.contains(&sid.trim())
+            {
+                fs_bail!("unexpected SID in DACL: {}", sid.trim());
             }
         }
     }
@@ -467,6 +653,46 @@ mod tests {
     use std::fs::{self, File};
     use std::io::Write;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn test_sddl() -> String {
+        super::Policy::new(Privacy::CurrentUser)
+            .unwrap()
+            .file_sddl()
+    }
+
+    #[test]
+    fn current_user_dir_is_created_private_and_verifies() {
+        let td = TestTempDir::new();
+        let d = td.path().join("a").join("b");
+        super::ensure_private_dir_with(&d, Privacy::CurrentUser).unwrap();
+        let pol = super::Policy::new(Privacy::CurrentUser).unwrap();
+        super::verify_secure_acl(&d, &pol).unwrap();
+        let sd = super::read_sddl(&d).unwrap();
+        assert!(
+            !sd.contains(";;;WD)") && !sd.contains(";;;BU)") && !sd.contains(";;;AU)"),
+            "{sd}"
+        );
+        super::atomic_write_private_with(&d.join("f"), b"x", Privacy::CurrentUser).unwrap();
+        assert_eq!(fs::read(d.join("f")).unwrap(), b"x");
+    }
+
+    #[test]
+    fn current_user_tightens_own_plain_dir() {
+        let td = TestTempDir::new();
+        let d = td.path().join("plain");
+        fs::create_dir_all(&d).unwrap();
+        // A plain directory inherits a broad DACL from %TEMP%; the owner may tighten it.
+        super::ensure_private_dir_with(&d, Privacy::CurrentUser).unwrap();
+        let pol = super::Policy::new(Privacy::CurrentUser).unwrap();
+        super::verify_secure_acl(&d, &pol).unwrap();
+    }
+
+    #[test]
+    fn sddl_text_has_no_trailing_nul() {
+        let td = TestTempDir::new();
+        let sd = super::read_sddl(td.path()).unwrap();
+        assert!(!sd.contains('\0'));
+    }
 
     struct TestTempDir {
         path: PathBuf,
@@ -512,7 +738,8 @@ mod tests {
         // Destination path (must remain untouched on temp collision)
         let dest = td.path().join("dest.bin");
         // Attempt exclusive create on the same tmp path via production helper; expect an error
-        let err = super::atomic_write_private_with_tmp(&dest, &collide, b"new-bytes").unwrap_err();
+        let err = super::atomic_write_private_with_tmp(&dest, &collide, b"new-bytes", &test_sddl())
+            .unwrap_err();
         let s = fs::read_to_string(&collide).unwrap();
         assert_eq!(s, "baseline", "preexisting file must remain untouched");
         assert!(
@@ -539,7 +766,7 @@ mod tests {
         // Choose a tmp path that does not exist
         let tmp = td.path().join(".unit-tmp-file.tmp");
         assert!(!tmp.exists());
-        super::atomic_write_private_with_tmp(&dest, &tmp, b"new")
+        super::atomic_write_private_with_tmp(&dest, &tmp, b"new", &test_sddl())
             .expect("atomic write with explicit tmp");
         // After success, tmp path should be gone (moved) and dest updated
         assert!(!tmp.exists(), "tmp path should not remain after rename");
@@ -556,7 +783,7 @@ mod tests {
         assert!(dest_dir.is_dir());
         // Attempt to atomically write where destination path is a directory: expect rename error,
         // and temp file must be removed by the guard.
-        let res = super::atomic_write_private_with_tmp(&dest_dir, &tmp, b"bytes");
+        let res = super::atomic_write_private_with_tmp(&dest_dir, &tmp, b"bytes", &test_sddl());
         assert!(
             res.is_err(),
             "expected error when renaming file onto directory"

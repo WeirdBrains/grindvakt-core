@@ -35,7 +35,7 @@ Around that loop it gives you the pieces Grindvakt uses to run unattended and sa
 | `vault` | Encrypted token store (`vault.json` v1): a password **and** a 24-word recovery phrase each unlock it; change or reset the password; read and set per-provider tokens |
 | `config` | The `config.toml` model (`AppConfig`, `Provider`, `Schedule`), validation, FQDN helpers, atomic save |
 | `schedule` | Checks for systemd/launchd schedules, plus portable "how long until the next run" for `hourly`, `daily`, `*:0/10` and intervals |
-| `fs` | Owner-only directories and atomic, fsynced, symlink-refusing file writes (Unix `0700/0600`; Windows protected DACL) |
+| `fs` | Private directories and atomic, fsynced, symlink-refusing file writes (Unix `0700/0600`; Windows protected DACL), per user or service-grade (`Privacy`) |
 | `lock` | A single-instance file lock so two syncs never race |
 | `paths` | (feature `default-paths`) Grindvakt's own `~/.grindvakt` / `%PROGRAMDATA%\Grindvakt` layout |
 
@@ -186,10 +186,12 @@ Tokio runtime, because reqwest does.
   `Error::WrongSecret`.
 * Files are written to a temp file, fsynced, renamed, and the directory fsynced; symlinks and
   reparse points are refused; on Unix the data directory must be owned by the current user.
-* The Windows `fs` rules match the Grindvakt service (SYSTEM, Administrators, LocalService
-  only) and reject directories owned by an ordinary user. An unprivileged Windows app should
-  keep its own directory and use the in-memory `Vault` APIs (`from_json`/`to_json`) with its
-  own storage.
+* Private means `fs::Privacy::CurrentUser` by default: on Windows a protected DACL for you and
+  SYSTEM only, so an ordinary unelevated app or browser can keep its config and vault in its
+  own profile directory (a directory you own with a looser DACL is tightened, like
+  `chmod 0700`). `Privacy::Service` (`save_with`, `ensure_private_dir_with`) applies the
+  Grindvakt service rules instead: SYSTEM, Administrators and LocalService only, and it refuses
+  directories an ordinary user owns.
 * This crate has not had an independent security audit.
 
 ## Platforms and MSRV
