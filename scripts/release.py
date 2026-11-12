@@ -10,7 +10,7 @@ Steps (stops at the first failure, never moves or overwrites tags):
   1. clean tree on `main`, up to date with origin/main, tag vX.Y.Z absent locally and remotely,
      X.Y.Z not already on crates.io, X.Y.Z greater than the current version (or equal when the
      current commit is an unreleased bump);
-  2. set `version` in Cargo.toml and Cargo.lock; require a `## X.Y.Z` CHANGELOG heading;
+  2. set `version` in Cargo.toml and Cargo.lock; require a Keep a Changelog `## [X.Y.Z]` heading;
   3. gates: fmt, clippy (all / no default features), tests (all / no default features),
      every example, `cargo package` + `cargo publish --dry-run`;
   4. commit `release: vX.Y.Z`, annotated tag vX.Y.Z, atomic push of main + tag;
@@ -106,8 +106,8 @@ def main() -> None:
     cur = current_version()
     if parse(v) < parse(cur) or (parse(v) == parse(cur) and cur in published):
         sys.exit(f"{v} must be newer than {cur}")
-    if f"## {v}" not in (ROOT / "CHANGELOG.md").read_text():
-        sys.exit(f"CHANGELOG.md needs a '## {v}' section")
+    if f"## [{v}]" not in (ROOT / "CHANGELOG.md").read_text():
+        sys.exit(f"CHANGELOG.md needs a '## [{v}]' section")
 
     set_version(v)
     run("cargo", "fmt", "--all", "--", "--check")
