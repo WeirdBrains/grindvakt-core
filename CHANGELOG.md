@@ -6,6 +6,19 @@ releases one for one.
 
 ## [Unreleased]
 
+### Added
+
+- `fs::Privacy::ServiceAccount(name)`: private to SYSTEM, Administrators and the service's
+  virtual account `NT SERVICE\<name>` (Windows), owned by SYSTEM or Administrators. Grindvakt
+  1.2.0 runs its Windows service under `NT SERVICE\Grindvakt` with it. On Unix it is owner-only,
+  like the other variants.
+- `fs::service_sid(name)`: the `S-1-5-80-…` SID of a service's virtual account, computed (it
+  exists whether or not the service is installed).
+- `fs::repair_private_tree(path, privacy)`: re-applies a privacy policy to every directory and
+  file under an existing tree (refusing symlinks and reparse points) and returns how many entries
+  it fixed. On Windows it also gives Administrators ownership of entries owned by an account the
+  policy doesn't accept, such as LocalService.
+
 ### Changed
 
 - Releases use the shared WeirdBrains release script (`scripts/weirdnet_release.py` with

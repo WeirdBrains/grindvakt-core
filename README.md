@@ -210,6 +210,10 @@ relays.
   DACL for you and SYSTEM), so an ordinary app can keep files in its own profile directory.
   `Privacy::Service` applies the Grindvakt service rules (SYSTEM, Administrators and
   LocalService only) and refuses directories an ordinary user owns.
+  `Privacy::ServiceAccount("Name")` does the same for a service's own virtual account
+  (`NT SERVICE\Name`, SID from `fs::service_sid`) instead of LocalService, and
+  `fs::repair_private_tree` re-applies a policy to a whole existing tree (for example to move
+  files a LocalService install wrote to the new account).
 * This crate has not had an independent security audit.
 
 ## Platforms and MSRV
