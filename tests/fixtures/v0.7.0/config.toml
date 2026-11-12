@@ -1,0 +1,9 @@
+provider = "dnsimple"
+account_id = 1234
+zone = "example.net"
+name = "home"
+ttl = 300
+sandbox = false
+
+[schedule]
+interval_secs = 300

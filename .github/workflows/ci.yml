@@ -1,0 +1,60 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    name: test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-15, windows-2022]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - name: fmt
+        run: cargo fmt --all -- --check
+      - name: clippy (all features)
+        run: cargo clippy --all-targets --all-features --locked -- -D warnings
+      - name: clippy (no default features)
+        run: cargo clippy --all-targets --no-default-features --locked -- -D warnings
+      - name: test (all features)
+        run: cargo test --all-features --locked
+      - name: test (no default features)
+        run: cargo test --no-default-features --locked
+      - name: examples
+        shell: bash
+        run: |
+          for e in config_load vault_roundtrip ip_consensus dns_sync_dry_run schedule_next embed_in_app; do
+            cargo run --locked --all-features --example "$e"
+          done
+      - name: package
+        if: runner.os == 'Linux'
+        run: cargo package --locked
+
+  msrv:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.99
+      - run: cargo check --all-features --locked
+
+  docs:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+      - name: docs.rs build
+        env:
+          RUSTDOCFLAGS: --cfg docsrs -D warnings
+        run: cargo doc --all-features --no-deps --locked

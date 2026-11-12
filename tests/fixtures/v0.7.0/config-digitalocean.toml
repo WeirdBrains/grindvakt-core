@@ -1,0 +1,8 @@
+provider = "digitalocean"
+zone = "example.org"
+name = "@"
+ttl = 600
+sandbox = false
+
+[schedule]
+calendar = "hourly"
