@@ -19,6 +19,11 @@
 //!    deletes, and will not guess which to keep). TXT: leftover existing records of the same
 //!    key are ambiguous only when a wanted record still needs a slot; otherwise they are left
 //!    alone.
+//! 4. `CNAME`: a name has at most one, so the group is that name's CNAME: kept, retargeted
+//!    or created. A CNAME must be the only record at its name, so the plan is ambiguous when
+//!    a wanted CNAME's name already has records of any other type (as reported by
+//!    [`DnsProvider::types_at`]), when a wanted `A`/`AAAA`/`TXT` record's name already has a
+//!    CNAME, or when the same plan wants a CNAME and another record at one name.
 //!
 //! ```
 //! use grindvakt_core::plan::{plan, apply, Change};
@@ -68,7 +73,7 @@ use crate::config::{normalize_fqdn, relative_name};
 use crate::error::{Error, Result};
 use crate::provider::DnsProvider;
 use crate::record::{ExistingRecord, Record, RecordKind, RecordValue, txt_key};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt;
 
 /// What will happen to one wanted record.
@@ -170,8 +175,8 @@ impl fmt::Display for Plan {
 }
 
 /// Reads the current records for every name and type in `want` and decides what to change.
-/// Writes nothing. Fails with [`Error::InvalidRecord`] for a bad name, TTL or TXT value,
-/// or two identical wanted records.
+/// Writes nothing. Fails with [`Error::InvalidRecord`] for a bad name, TTL, TXT value or
+/// CNAME target, two identical wanted records, or two wanted CNAMEs at one name.
 pub async fn plan<P: DnsProvider + ?Sized>(
     provider: &P,
     zone: &str,
@@ -194,6 +199,16 @@ pub async fn plan<P: DnsProvider + ?Sized>(
             return Err(Error::InvalidRecord(format!(
                 "{} {} is listed twice",
                 r.kind(),
+                normalize_fqdn(&zone, &r.name)
+            )));
+        }
+        if r.kind() == RecordKind::Cname
+            && wanted
+                .iter()
+                .any(|w: &Record| w.name == r.name && w.kind() == RecordKind::Cname)
+        {
+            return Err(Error::InvalidRecord(format!(
+                "CNAME {} is listed twice with different targets; a name has one CNAME",
                 normalize_fqdn(&zone, &r.name)
             )));
         }
@@ -293,6 +308,75 @@ pub async fn plan<P: DnsProvider + ?Sized>(
                     prev_ttl: e.ttl,
                 },
                 None => Change::Create,
+            });
+        }
+    }
+
+    // CNAME exclusivity, in both directions. Never resolved by deleting: the plan is refused.
+    let mut cname_names = BTreeSet::new();
+    let mut other_names: BTreeMap<String, BTreeSet<RecordKind>> = BTreeMap::new();
+    for r in &wanted {
+        if r.kind() == RecordKind::Cname {
+            cname_names.insert(r.name.clone());
+        } else {
+            other_names
+                .entry(r.name.clone())
+                .or_default()
+                .insert(r.kind());
+        }
+    }
+    let mut conflicts: HashMap<String, String> = HashMap::new();
+    for name in &cname_names {
+        let fqdn = normalize_fqdn(&zone, name);
+        if let Some(kinds) = other_names.get(name) {
+            let kinds: Vec<&str> = kinds.iter().map(|k| k.as_str()).collect();
+            conflicts.insert(
+                name.clone(),
+                format!(
+                    "a CNAME and {} records are both wanted at {fqdn}; a CNAME must be alone at its name",
+                    kinds.join("/")
+                ),
+            );
+            continue;
+        }
+        let others: BTreeSet<String> = provider
+            .types_at(&zone, name)
+            .await?
+            .into_iter()
+            .map(|t| t.to_ascii_uppercase())
+            .filter(|t| t != RecordKind::Cname.as_str())
+            .collect();
+        if !others.is_empty() {
+            let others: Vec<String> = others.into_iter().collect();
+            conflicts.insert(
+                name.clone(),
+                format!(
+                    "{fqdn} already has {} records; a CNAME must be alone at its name (nothing is deleted)",
+                    others.join("/")
+                ),
+            );
+        }
+    }
+    for name in other_names.keys() {
+        if cname_names.contains(name) {
+            continue;
+        }
+        let cnames = provider.list(&zone, name, RecordKind::Cname).await?;
+        if let Some(c) = cnames.first() {
+            let fqdn = normalize_fqdn(&zone, name);
+            conflicts.insert(
+                name.clone(),
+                format!(
+                    "{fqdn} is a CNAME to {}; it cannot also have other records (nothing is deleted)",
+                    c.value.content()
+                ),
+            );
+        }
+    }
+    for (r, c) in wanted.iter().zip(changes.iter_mut()) {
+        if let Some(reason) = conflicts.get(&r.name) {
+            *c = Some(Change::Ambiguous {
+                reason: reason.clone(),
             });
         }
     }

@@ -9,9 +9,11 @@
 //!     Record::a("home", Ipv4Addr::new(203, 0, 113, 7)),
 //!     Record::aaaa("home", "2001:db8::7".parse::<Ipv6Addr>().unwrap()).with_ttl(120),
 //!     Record::txt("_dnsaddr.home", format!("dnsaddr=/dns4/home.example.com/tcp/4747/p2p/{peer}")),
+//!     Record::cname("www", "home.example.com"),
 //! ];
 //! assert_eq!(want[1].kind(), RecordKind::Aaaa);
 //! assert_eq!(want[2].txt_key(), Some("dnsaddr="));
+//! assert_eq!(want[3].kind(), RecordKind::Cname);
 //! ```
 
 use crate::error::{Error, Result};
@@ -36,15 +38,26 @@ pub enum RecordKind {
     Aaaa,
     /// Text.
     Txt,
+    /// Canonical name (an alias for another name).
+    Cname,
 }
 
 impl RecordKind {
-    /// The DNS type name: `A`, `AAAA` or `TXT`.
+    /// Every kind, in a stable order.
+    pub const ALL: [RecordKind; 4] = [
+        RecordKind::A,
+        RecordKind::Aaaa,
+        RecordKind::Txt,
+        RecordKind::Cname,
+    ];
+
+    /// The DNS type name: `A`, `AAAA`, `TXT` or `CNAME`.
     pub fn as_str(self) -> &'static str {
         match self {
             RecordKind::A => "A",
             RecordKind::Aaaa => "AAAA",
             RecordKind::Txt => "TXT",
+            RecordKind::Cname => "CNAME",
         }
     }
 }
@@ -65,6 +78,9 @@ pub enum RecordValue {
     Aaaa(Ipv6Addr),
     /// A `TXT` record, unquoted (see [`normalize_txt`]).
     Txt(String),
+    /// A `CNAME` record: the full target name, compared case-insensitively and without a
+    /// trailing dot (see [`normalize_target`]).
+    Cname(String),
 }
 
 impl RecordValue {
@@ -74,19 +90,23 @@ impl RecordValue {
             RecordValue::A(_) => RecordKind::A,
             RecordValue::Aaaa(_) => RecordKind::Aaaa,
             RecordValue::Txt(_) => RecordKind::Txt,
+            RecordValue::Cname(_) => RecordKind::Cname,
         }
     }
 
-    /// The value as providers store it (`content` / `data`).
+    /// The value as providers store it (`content` / `data`). A CNAME target is lowercase,
+    /// without a trailing dot; providers that want one (DigitalOcean) add it.
     pub fn content(&self) -> String {
         match self {
             RecordValue::A(ip) => ip.to_string(),
             RecordValue::Aaaa(ip) => ip.to_string(),
             RecordValue::Txt(t) => t.clone(),
+            RecordValue::Cname(t) => normalize_target(t),
         }
     }
 
-    /// Parses provider `content` for `kind`. TXT content is normalized with [`normalize_txt`].
+    /// Parses provider `content` for `kind`. TXT content is normalized with [`normalize_txt`];
+    /// a CNAME target with [`normalize_target`] (it must be a full name).
     pub fn parse(kind: RecordKind, content: &str) -> Result<Self> {
         let c = content.trim();
         match kind {
@@ -97,13 +117,27 @@ impl RecordValue {
                 Error::InvalidRecord(format!("not an IPv6 address in AAAA record: {c:?}"))
             }),
             RecordKind::Txt => Ok(RecordValue::Txt(normalize_txt(c))),
+            RecordKind::Cname => {
+                let t = normalize_target(c);
+                if is_valid_target(&t) {
+                    Ok(RecordValue::Cname(t))
+                } else {
+                    Err(Error::InvalidRecord(format!(
+                        "not a host name in CNAME record: {c:?}"
+                    )))
+                }
+            }
         }
     }
 
-    /// Same data, comparing TXT values after [`normalize_txt`].
+    /// Same data, comparing TXT values after [`normalize_txt`] and CNAME targets after
+    /// [`normalize_target`].
     pub fn same_data(&self, other: &RecordValue) -> bool {
         match (self, other) {
             (RecordValue::Txt(a), RecordValue::Txt(b)) => normalize_txt(a) == normalize_txt(b),
+            (RecordValue::Cname(a), RecordValue::Cname(b)) => {
+                normalize_target(a) == normalize_target(b)
+            }
             (a, b) => a == b,
         }
     }
@@ -145,6 +179,26 @@ impl Record {
     pub fn txt(name: impl Into<String>, text: impl Into<String>) -> Self {
         Self::new(name, RecordValue::Txt(text.into()))
     }
+    /// A `CNAME` record with [`DEFAULT_TTL`]: `name` becomes an alias for `target`, a full
+    /// host name (a trailing dot is optional, case is ignored). A CNAME must be the only record
+    /// at its name and cannot sit at the zone apex; [`crate::plan()`] refuses plans that
+    /// would break either rule.
+    ///
+    /// ```
+    /// use grindvakt_core::record::{Record, RecordValue};
+    ///
+    /// let r = Record::cname("www", "Home.Example.com.");
+    /// assert!(r.validate("example.com").is_ok());
+    /// assert_eq!(r.value.content(), "home.example.com");
+    /// assert!(r.value.same_data(&RecordValue::Cname("home.example.com".into())));
+    ///
+    /// assert!(Record::cname("@", "home.example.com").validate("example.com").is_err()); // apex
+    /// assert!(Record::cname("www", "not a name").validate("example.com").is_err());
+    /// assert!(Record::cname("www", "www.example.com").validate("example.com").is_err()); // itself
+    /// ```
+    pub fn cname(name: impl Into<String>, target: impl Into<String>) -> Self {
+        Self::new(name, RecordValue::Cname(target.into()))
+    }
     /// A record with [`DEFAULT_TTL`].
     pub fn new(name: impl Into<String>, value: RecordValue) -> Self {
         Self {
@@ -172,7 +226,9 @@ impl Record {
         }
     }
 
-    /// Checks the name against `zone`, the TTL and the TXT length.
+    /// Checks the name against `zone`, the TTL, the TXT length and, for a CNAME, that the
+    /// target is a full host name other than the record itself and that the name is not the
+    /// zone apex.
     pub fn validate(&self, zone: &str) -> Result<()> {
         if self.ttl < MIN_TTL {
             return Err(Error::InvalidRecord(format!(
@@ -199,6 +255,26 @@ impl Record {
                 return Err(Error::InvalidRecord(format!(
                     "TXT {}: value must not contain quotes or newlines",
                     self.name
+                )));
+            }
+        }
+        if let RecordValue::Cname(t) = &self.value {
+            let fqdn = crate::config::normalize_fqdn(zone, &self.name).to_ascii_lowercase();
+            let zone_l = zone.trim().trim_end_matches('.').to_ascii_lowercase();
+            if fqdn == zone_l {
+                return Err(Error::InvalidRecord(format!(
+                    "CNAME {fqdn}: a CNAME cannot be at the zone apex"
+                )));
+            }
+            let target = normalize_target(t);
+            if !is_valid_target(&target) {
+                return Err(Error::InvalidRecord(format!(
+                    "CNAME {fqdn}: target {t:?} is not a full host name"
+                )));
+            }
+            if target == fqdn {
+                return Err(Error::InvalidRecord(format!(
+                    "CNAME {fqdn}: a CNAME cannot point at itself"
                 )));
             }
         }
@@ -238,6 +314,33 @@ pub fn normalize_txt(s: &str) -> String {
         return inner.replace("\\\"", "\"");
     }
     t.to_string()
+}
+
+/// Lowercases a host name and drops surrounding space and one trailing dot.
+///
+/// ```
+/// use grindvakt_core::record::normalize_target;
+/// assert_eq!(normalize_target(" Home.Example.COM. "), "home.example.com");
+/// ```
+pub fn normalize_target(s: &str) -> String {
+    let t = s.trim();
+    t.strip_suffix('.').unwrap_or(t).to_ascii_lowercase()
+}
+
+/// Whether `target` (already normalized) is a full host name: at least two labels of 1–63
+/// letters, digits, `-` or `_`, not starting or ending with `-`, at most 253 bytes.
+pub(crate) fn is_valid_target(target: &str) -> bool {
+    !target.is_empty()
+        && target.len() <= 253
+        && target.contains('.')
+        && target.split('.').all(|l| {
+            !l.is_empty()
+                && l.len() <= 63
+                && !l.starts_with('-')
+                && !l.ends_with('-')
+                && l.bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+        })
 }
 
 pub(crate) fn txt_key(t: &str) -> &str {

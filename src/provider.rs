@@ -52,6 +52,25 @@ pub trait DnsProvider {
         value: &RecordValue,
         ttl: u32,
     ) -> impl Future<Output = Result<()>> + Send;
+
+    /// The DNS types of every record named `name` (relative, `""` for the apex), one entry per
+    /// record, including types this crate does not manage (`MX`, `SRV`, ...). [`crate::plan()`]
+    /// uses it to keep a CNAME the only record at its name.
+    ///
+    /// The default asks [`DnsProvider::list`] for each [`RecordKind`], so it sees only the
+    /// managed types; the built-in providers override it to report every type.
+    fn types_at(&self, zone: &str, name: &str) -> impl Future<Output = Result<Vec<String>>> + Send {
+        let lists = RecordKind::ALL.map(|k| (k, self.list(zone, name, k)));
+        async move {
+            let mut out = Vec::new();
+            for (kind, list) in lists {
+                for _ in list.await? {
+                    out.push(kind.as_str().to_string());
+                }
+            }
+            Ok(out)
+        }
+    }
 }
 
 /// Options for the built-in providers.
@@ -168,6 +187,10 @@ impl DnsProvider for AnyProvider {
     async fn update(&self, zone: &str, id: u64, value: &RecordValue, ttl: u32) -> Result<()> {
         dispatch!(self, p => p.update(zone, id, value, ttl).await)
     }
+    #[allow(unused_variables)]
+    async fn types_at(&self, zone: &str, name: &str) -> Result<Vec<String>> {
+        dispatch!(self, p => p.types_at(zone, name).await)
+    }
 }
 
 #[cfg(feature = "dnsimple")]
@@ -176,7 +199,9 @@ pub use self::dnsimple_impl::DnsimpleProvider;
 #[cfg(feature = "dnsimple")]
 mod dnsimple_impl {
     use super::*;
-    use ::dnsimple::dnsimple::zones_records::{ZoneRecordPayload, ZoneRecordUpdatePayload};
+    use ::dnsimple::dnsimple::zones_records::{
+        ZoneRecord, ZoneRecordPayload, ZoneRecordUpdatePayload,
+    };
     use ::dnsimple::dnsimple::{Client, Filters, Paginate, RequestOptions, new_client};
     use ::dnsimple::errors::DNSimpleError;
     use std::collections::HashMap;
@@ -259,26 +284,23 @@ mod dnsimple_impl {
                 )
             })
         }
-    }
 
-    impl DnsProvider for DnsimpleProvider {
-        fn name(&self) -> &str {
-            NAME
-        }
-
-        async fn list(
+        /// Every record named exactly `name`, of `kind` or of any type.
+        async fn raw_list(
             &self,
             zone: &str,
             name: &str,
-            kind: RecordKind,
-        ) -> Result<Vec<ExistingRecord>> {
+            kind: Option<RecordKind>,
+        ) -> Result<Vec<ZoneRecord>> {
             let account = self.account().await?;
             let mut page: u32 = 1;
             let mut out = Vec::new();
             loop {
                 let resp = with_retries(|| async {
                     let mut fmap = HashMap::new();
-                    fmap.insert("type".to_string(), kind.as_str().to_string());
+                    if let Some(kind) = kind {
+                        fmap.insert("type".to_string(), kind.as_str().to_string());
+                    }
                     if !name.is_empty() {
                         fmap.insert("name".to_string(), name.to_string());
                     }
@@ -298,13 +320,8 @@ mod dnsimple_impl {
                 .await
                 .map_err(|e| map_err(&format!("list_zone_records page {page}"), e))?;
                 for r in resp.data.unwrap_or_default() {
-                    if r.record_type == kind.as_str() && r.name == name {
-                        out.push(ExistingRecord {
-                            id: r.id,
-                            name: r.name.clone(),
-                            value: RecordValue::parse(kind, &r.content)?,
-                            ttl: u32::try_from(r.ttl).ok(),
-                        });
+                    if r.name == name && kind.is_none_or(|k| r.record_type == k.as_str()) {
+                        out.push(r);
                     }
                 }
                 let pagination = resp.pagination.ok_or_else(|| err("missing pagination"))?;
@@ -314,6 +331,39 @@ mod dnsimple_impl {
                 page += 1;
             }
             Ok(out)
+        }
+    }
+
+    impl DnsProvider for DnsimpleProvider {
+        fn name(&self) -> &str {
+            NAME
+        }
+
+        async fn list(
+            &self,
+            zone: &str,
+            name: &str,
+            kind: RecordKind,
+        ) -> Result<Vec<ExistingRecord>> {
+            let mut out = Vec::new();
+            for r in self.raw_list(zone, name, Some(kind)).await? {
+                out.push(ExistingRecord {
+                    id: r.id,
+                    name: r.name.clone(),
+                    value: RecordValue::parse(kind, &r.content)?,
+                    ttl: u32::try_from(r.ttl).ok(),
+                });
+            }
+            Ok(out)
+        }
+
+        async fn types_at(&self, zone: &str, name: &str) -> Result<Vec<String>> {
+            Ok(self
+                .raw_list(zone, name, None)
+                .await?
+                .into_iter()
+                .map(|r| r.record_type)
+                .collect())
         }
 
         async fn create(
@@ -499,7 +549,85 @@ mod digitalocean_impl {
         if name.is_empty() { "@" } else { name }
     }
 
+    /// DigitalOcean wants a CNAME target as a fully qualified name with a trailing dot.
+    fn to_do_data(value: &RecordValue) -> String {
+        match value {
+            RecordValue::Cname(_) => format!("{}.", value.content()),
+            _ => value.content(),
+        }
+    }
+
+    /// DigitalOcean reports CNAME data as `target.` (absolute), `@` (the apex) or, for names
+    /// created without a dot, relative to the zone.
+    fn from_do_data(zone: &str, kind: RecordKind, data: &str) -> Result<RecordValue> {
+        if kind != RecordKind::Cname {
+            return RecordValue::parse(kind, data);
+        }
+        let d = data.trim();
+        let zone = zone.trim_end_matches('.');
+        let full = if d == "@" {
+            zone.to_string()
+        } else if d.ends_with('.') {
+            d.to_string()
+        } else {
+            format!("{d}.{zone}")
+        };
+        RecordValue::parse(kind, &full)
+    }
+
     impl DigitalOceanProvider {
+        /// Every record named exactly `name`, of `kind` or of any type.
+        async fn raw_list(
+            &self,
+            zone: &str,
+            name: &str,
+            kind: Option<RecordKind>,
+        ) -> Result<Vec<DoRecord>> {
+            let want = to_do_name(name);
+            let mut page: u32 = 1;
+            let mut out = Vec::new();
+            loop {
+                if page > MAX_PAGES {
+                    return Err(err("list: pagination exceeded safety cap"));
+                }
+                let mut url = format!(
+                    "{}/v2/domains/{}/records?page={}&per_page=200",
+                    self.api_base, zone, page
+                );
+                if let Some(kind) = kind {
+                    url.push_str("&type=");
+                    url.push_str(kind.as_str());
+                }
+                let resp = self
+                    .client
+                    .get(&url)
+                    .bearer_auth(self.token.expose_secret())
+                    .send()
+                    .await
+                    .map_err(|e| net("list", e))?;
+                if !resp.status().is_success() {
+                    return Err(status_err("list", &resp));
+                }
+                let body: ListResp = resp.json().await.map_err(|e| net("parse list", e))?;
+                for r in body.domain_records {
+                    if r.name == want && kind.is_none_or(|k| r.r#type == k.as_str()) {
+                        out.push(r);
+                    }
+                }
+                if body
+                    .links
+                    .and_then(|l| l.pages)
+                    .and_then(|p| p.next)
+                    .is_some()
+                {
+                    page += 1;
+                } else {
+                    break;
+                }
+            }
+            Ok(out)
+        }
+
         /// A client for `base_url`, or the public API when `None`.
         pub fn new(token: &SecretString, base_url: Option<&str>) -> Result<Self> {
             let client = reqwest::Client::builder()
@@ -530,53 +658,25 @@ mod digitalocean_impl {
             name: &str,
             kind: RecordKind,
         ) -> Result<Vec<ExistingRecord>> {
-            let want = to_do_name(name);
-            let mut page: u32 = 1;
             let mut out = Vec::new();
-            loop {
-                if page > MAX_PAGES {
-                    return Err(err("list: pagination exceeded safety cap"));
-                }
-                let url = format!(
-                    "{}/v2/domains/{}/records?page={}&per_page=200&type={}",
-                    self.api_base,
-                    zone,
-                    page,
-                    kind.as_str()
-                );
-                let resp = self
-                    .client
-                    .get(&url)
-                    .bearer_auth(self.token.expose_secret())
-                    .send()
-                    .await
-                    .map_err(|e| net("list", e))?;
-                if !resp.status().is_success() {
-                    return Err(status_err("list", &resp));
-                }
-                let body: ListResp = resp.json().await.map_err(|e| net("parse list", e))?;
-                for r in body.domain_records {
-                    if r.r#type == kind.as_str() && r.name == want {
-                        out.push(ExistingRecord {
-                            id: u64::try_from(r.id).map_err(|_| err("negative record id"))?,
-                            name: name.to_string(),
-                            value: RecordValue::parse(kind, &r.data)?,
-                            ttl: r.ttl.and_then(|t| u32::try_from(t).ok()),
-                        });
-                    }
-                }
-                if body
-                    .links
-                    .and_then(|l| l.pages)
-                    .and_then(|p| p.next)
-                    .is_some()
-                {
-                    page += 1;
-                } else {
-                    break;
-                }
+            for r in self.raw_list(zone, name, Some(kind)).await? {
+                out.push(ExistingRecord {
+                    id: u64::try_from(r.id).map_err(|_| err("negative record id"))?,
+                    name: name.to_string(),
+                    value: from_do_data(zone, kind, &r.data)?,
+                    ttl: r.ttl.and_then(|t| u32::try_from(t).ok()),
+                });
             }
             Ok(out)
+        }
+
+        async fn types_at(&self, zone: &str, name: &str) -> Result<Vec<String>> {
+            Ok(self
+                .raw_list(zone, name, None)
+                .await?
+                .into_iter()
+                .map(|r| r.r#type)
+                .collect())
         }
 
         async fn create(
@@ -590,7 +690,7 @@ mod digitalocean_impl {
             let body = serde_json::json!({
                 "type": value.kind().as_str(),
                 "name": to_do_name(name),
-                "data": value.content(),
+                "data": to_do_data(value),
                 "ttl": ttl,
             });
             let resp = self
@@ -609,7 +709,7 @@ mod digitalocean_impl {
 
         async fn update(&self, zone: &str, id: u64, value: &RecordValue, ttl: u32) -> Result<()> {
             let url = format!("{}/v2/domains/{}/records/{}", self.api_base, zone, id);
-            let body = serde_json::json!({ "data": value.content(), "ttl": ttl });
+            let body = serde_json::json!({ "data": to_do_data(value), "ttl": ttl });
             let resp = self
                 .client
                 .patch(&url)

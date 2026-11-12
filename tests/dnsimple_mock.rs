@@ -67,6 +67,7 @@ async fn plans_noop_create_and_ambiguous() {
         ]),
     )
     .await;
+    list_mock(&server, "CNAME", json!([])).await;
     let c = client(&server);
     let p = plan(
         &c,
@@ -88,7 +89,7 @@ async fn plans_noop_create_and_ambiguous() {
 #[tokio::test]
 async fn creates_a_aaaa_and_txt_with_expected_bodies() {
     let server = MockServer::start().await;
-    for k in ["A", "AAAA", "TXT"] {
+    for k in ["A", "AAAA", "TXT", "CNAME"] {
         list_mock(&server, k, json!([])).await;
     }
     let txt = "dnsaddr=/dns4/home.example.com/tcp/4747/p2p/12D3KooWTest";
@@ -137,6 +138,7 @@ async fn quoted_txt_from_dnsimple_matches() {
         ]),
     )
     .await;
+    list_mock(&server, "CNAME", json!([])).await;
     let c = client(&server);
     let p = plan(
         &c,
@@ -189,6 +191,85 @@ async fn updates_with_patch_and_reads_all_pages() {
         matches!(&p.actions[0].change, Change::Update { id: 7, prev: RecordValue::A(prev), .. } if *prev == v4("9.9.9.9"))
     );
     apply(&c, &p).await.unwrap();
+}
+
+#[tokio::test]
+async fn cname_create_update_and_conflicts() {
+    let server = MockServer::start().await;
+    list_mock(
+        &server,
+        "CNAME",
+        json!([rec(50, "www", "CNAME", "old.example.net", 300)]),
+    )
+    .await;
+    list_mock(&server, "A", json!([])).await;
+    // Any-type listing (no `type` filter): "mail" has MX, "www" only its CNAME.
+    Mock::given(method("GET"))
+        .and(path_regex(".*/zones/example.com/records$"))
+        .and(wiremock::matchers::query_param_is_missing("type"))
+        .and(query_param("name", "mail"))
+        .respond_with(rl(ResponseTemplate::new(200).set_body_json(page(
+            json!([rec(60, "mail", "MX", "mx.example.net", 300)]),
+            1,
+            1,
+        ))))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path_regex(".*/zones/example.com/records$"))
+        .and(wiremock::matchers::query_param_is_missing("type"))
+        .respond_with(rl(ResponseTemplate::new(200).set_body_json(page(
+            json!([rec(50, "www", "CNAME", "old.example.net", 300)]),
+            1,
+            1,
+        ))))
+        .mount(&server)
+        .await;
+    Mock::given(method("PATCH"))
+        .and(path_regex(".*/v2/1234/zones/example.com/records/50$"))
+        .and(body_json(
+            json!({"name": null, "content": "home.example.com", "ttl": 300, "priority": null}),
+        ))
+        .respond_with(rl(ResponseTemplate::new(200).set_body_json(
+            json!({"data": rec(50, "www", "CNAME", "home.example.com", 300)}),
+        )))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let c = client(&server);
+    let p = plan(
+        &c,
+        "example.com",
+        &[Record::cname("www", "Home.Example.com.")],
+    )
+    .await
+    .unwrap();
+    assert!(
+        matches!(&p.actions[0].change, Change::Update { id: 50, prev: RecordValue::Cname(t), .. } if t == "old.example.net"),
+        "{p}"
+    );
+    apply(&c, &p).await.unwrap();
+
+    let p = plan(
+        &c,
+        "example.com",
+        &[Record::cname("mail", "home.example.com")],
+    )
+    .await
+    .unwrap();
+    assert!(
+        matches!(&p.actions[0].change, Change::Ambiguous { reason } if reason.contains("MX")),
+        "{p}"
+    );
+    // An A record where a CNAME exists is refused too.
+    let p = plan(&c, "example.com", &[Record::a("www", v4("1.2.3.4"))])
+        .await
+        .unwrap();
+    assert!(
+        matches!(&p.actions[0].change, Change::Ambiguous { reason } if reason.contains("CNAME")),
+        "{p}"
+    );
+    assert!(matches!(apply(&c, &p).await, Err(Error::Ambiguous(_))));
 }
 
 #[tokio::test]
