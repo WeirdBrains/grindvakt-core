@@ -15,7 +15,7 @@
 //! ```
 
 use crate::error::{Error, IoContext, Result};
-use crate::fs::atomic_write_private;
+use crate::fs::{Privacy, atomic_write_private_with};
 use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::path::Path;
@@ -182,11 +182,17 @@ impl AppConfig {
             .map_err(|e| Error::Config(format!("parsing {}: {e}", path.display())))
     }
 
-    /// Writes the config atomically with owner-only permissions
+    /// Writes the config atomically, private to the current user
     /// (see [`crate::fs::atomic_write_private`]).
     pub fn save(&self, path: &Path) -> Result<()> {
+        self.save_with(path, Privacy::CurrentUser)
+    }
+
+    /// [`AppConfig::save`] under an explicit [`Privacy`] policy, such as
+    /// [`Privacy::Service`] for data a system service reads.
+    pub fn save_with(&self, path: &Path, privacy: Privacy) -> Result<()> {
         let text = self.to_toml_string()?;
-        atomic_write_private(path, text.as_bytes())
+        atomic_write_private_with(path, text.as_bytes(), privacy)
     }
 }
 

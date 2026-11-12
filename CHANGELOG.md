@@ -12,4 +12,6 @@ First release, extracted from Grindvakt v0.7.0.
   the password, per-provider tokens). It is byte-compatible with Grindvakt 0.x vaults in both
   directions, with crypto from `weirdnet-keys` 0.1.
 * Config model and TOML I/O, schedule checks, portable timing via `weirdnet-rules` cron,
-  secure file writes, single-instance lock, and optional Grindvakt default paths.
+  private file writes (`fs::Privacy::CurrentUser` by default, `Privacy::Service` for the
+  Grindvakt service rules on Windows), single-instance lock, and optional Grindvakt default
+  paths.
