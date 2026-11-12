@@ -32,15 +32,55 @@ jobs:
         run: cargo test --all-features --locked
       - name: test (no default features)
         run: cargo test --no-default-features --locked
+      - name: each feature alone
+        shell: bash
+        run: |
+          for f in dnsimple digitalocean public-ip vault standalone; do
+            cargo clippy --all-targets --no-default-features --features "$f" --locked -- -D warnings
+          done
       - name: examples
         shell: bash
         run: |
-          for e in config_load vault_roundtrip ip_consensus dns_sync_dry_run schedule_next embed_in_app; do
+          for e in config_load vault_roundtrip ip_discovery dns_plan_dry_run embed_in_app; do
             cargo run --locked --all-features --example "$e"
           done
       - name: package
         if: runner.os == 'Linux'
         run: cargo package --locked
+
+  android:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android, x86_64-linux-android
+      - name: cargo check (Android, NDK clang)
+        shell: bash
+        run: |
+          TC="$ANDROID_NDK_LATEST_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin"
+          export CC_aarch64_linux_android="$TC/aarch64-linux-android24-clang"
+          export AR_aarch64_linux_android="$TC/llvm-ar"
+          export CC_x86_64_linux_android="$TC/x86_64-linux-android24-clang"
+          export AR_x86_64_linux_android="$TC/llvm-ar"
+          for t in aarch64-linux-android x86_64-linux-android; do
+            cargo check --locked --all-features --target "$t"
+            cargo check --locked --target "$t"
+          done
+
+  ios:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-ios, aarch64-apple-ios-sim
+      - name: cargo check (iOS)
+        run: |
+          for t in aarch64-apple-ios aarch64-apple-ios-sim; do
+            cargo check --locked --all-features --target "$t"
+            cargo check --locked --target "$t"
+          done
 
   msrv:
     runs-on: ubuntu-latest
@@ -48,6 +88,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.99
       - run: cargo check --all-features --locked
+      - run: cargo check --no-default-features --locked
 
   docs:
     runs-on: ubuntu-latest

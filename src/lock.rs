@@ -56,8 +56,8 @@ impl SingleInstanceLock {
 
     /// Locks `name` (sanitized) under Grindvakt's default lock directory
     /// ([`crate::paths::default_lock_dir`]).
-    #[cfg(feature = "default-paths")]
-    #[cfg_attr(docsrs, doc(cfg(feature = "default-paths")))]
+    #[cfg(feature = "standalone")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "standalone")))]
     pub fn acquire(name: &str) -> Result<Self> {
         let path = crate::paths::default_lock_dir()?.join(format!("{}.lock", sanitize_name(name)));
         Self::acquire_at(&path)

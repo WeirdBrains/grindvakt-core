@@ -32,7 +32,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 CRATE = "grindvakt-core"
 SEMVER = re.compile(r"^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$")
-EXAMPLES = ["config_load", "vault_roundtrip", "ip_consensus", "dns_sync_dry_run", "schedule_next", "embed_in_app"]
+EXAMPLES = ["config_load", "vault_roundtrip", "ip_discovery", "dns_plan_dry_run", "embed_in_app"]
 UA = {"User-Agent": "grindvakt-core release script (https://github.com/WeirdBrains/grindvakt-core)"}
 
 

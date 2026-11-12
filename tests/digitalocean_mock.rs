@@ -1,321 +1,197 @@
+//! DigitalOcean provider against a mock API.
 #![cfg(feature = "digitalocean")]
-use grindvakt_core::SecretString;
-use grindvakt_core::config::{AppConfig, Provider, Schedule};
-use grindvakt_core::provider::build;
-use grindvakt_core::provider::{DnsAction, DnsProvider};
+use grindvakt_core::plan::Change;
+use grindvakt_core::provider::{DigitalOceanProvider, DnsProvider};
+use grindvakt_core::record::{Record, RecordKind};
+use grindvakt_core::{Error, SecretString, apply, plan};
 use serde_json::json;
-use std::net::Ipv4Addr;
-use wiremock::matchers::{method, path_regex, query_param};
+use std::time::Duration;
+use wiremock::matchers::{body_json, header, method, path, query_param};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
-fn do_list_resp(records: serde_json::Value, next: bool) -> serde_json::Value {
-    json!({"domain_records": records, "links": if next { json!({"pages":{"next":"n"}}) } else { json!({}) }})
+fn list(records: serde_json::Value, next: bool) -> serde_json::Value {
+    json!({"domain_records": records, "links": if next { json!({"pages": {"next": "n"}}) } else { json!({}) }})
 }
 
-#[tokio::test]
-async fn do_plan_create_when_missing() {
-    let server = MockServer::start().await;
-    let resp = do_list_resp(json!([]), false);
+fn client(server: &MockServer) -> DigitalOceanProvider {
+    DigitalOceanProvider::new(
+        &SecretString::from("do_test_token".to_string()),
+        Some(&server.uri()),
+    )
+    .unwrap()
+}
+
+async fn list_mock(server: &MockServer, kind: &str, records: serde_json::Value) {
     Mock::given(method("GET"))
-        .and(path_regex("/v2/domains/.*/records"))
-        .and(query_param("type", "A"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(resp))
-        .mount(&server)
+        .and(path("/v2/domains/example.com/records"))
+        .and(query_param("type", kind))
+        .and(header("authorization", "Bearer do_test_token"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(list(records, false)))
+        .mount(server)
         .await;
-    let cfg = AppConfig {
-        provider: Provider::Digitalocean,
-        account_id: None,
-        zone: "example.com".into(),
-        name: "www".into(),
-        ttl: 300,
-        sandbox: false,
-        api_base_url: Some(server.uri()),
-        schedule: Schedule {
-            calendar: None,
-            interval_secs: Some(300),
-        },
-    };
-    let token = SecretString::from("do_test_token".to_string());
-    let provider = build(&cfg, &token).unwrap();
-    let action = provider
-        .plan(&cfg, "1.2.3.4".parse().unwrap())
-        .await
-        .unwrap();
-    match action {
-        DnsAction::Create { name, ttl } => {
-            assert_eq!(name, "www");
-            assert_eq!(ttl, 300);
-        }
-        _ => panic!("expected Create"),
-    }
 }
 
 #[tokio::test]
-async fn do_plan_noop_when_matching_ip_and_ttl() {
+async fn noop_update_and_apex() {
     let server = MockServer::start().await;
-    let recs = json!([ { "id": 10, "type":"A", "name":"www", "data":"1.2.3.4", "ttl": 300 } ]);
-    let resp = do_list_resp(recs, false);
-    Mock::given(method("GET"))
-        .and(path_regex("/v2/domains/.*/records"))
-        .and(query_param("type", "A"))
-        .and(query_param("name", "www"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(resp))
-        .mount(&server)
-        .await;
-    let cfg = AppConfig {
-        provider: Provider::Digitalocean,
-        account_id: None,
-        zone: "example.com".into(),
-        name: "www".into(),
-        ttl: 300,
-        sandbox: false,
-        api_base_url: Some(server.uri()),
-        schedule: Schedule {
-            calendar: None,
-            interval_secs: Some(300),
-        },
-    };
-    let token = SecretString::from("do_test_token".to_string());
-    let provider = build(&cfg, &token).unwrap();
-    let action = provider
-        .plan(&cfg, "1.2.3.4".parse().unwrap())
-        .await
-        .unwrap();
-    match action {
-        DnsAction::Noop(ip) => {
-            let want: Ipv4Addr = "1.2.3.4".parse::<Ipv4Addr>().unwrap();
-            assert_eq!(ip, want)
-        }
-        _ => panic!("expected Noop"),
-    }
+    list_mock(
+        &server,
+        "A",
+        json!([
+            {"id": 10, "type": "A", "name": "www", "data": "1.2.3.4", "ttl": 300},
+            {"id": 11, "type": "A", "name": "@", "data": "1.2.3.4", "ttl": 1800},
+            {"id": 12, "type": "A", "name": "other", "data": "8.8.8.8", "ttl": 300},
+        ]),
+    )
+    .await;
+    let c = client(&server);
+    let ip = "1.2.3.4".parse().unwrap();
+    let p = plan(
+        &c,
+        "example.com",
+        &[
+            Record::a("www", ip),
+            Record::a("@", ip),
+            Record::a("new", ip),
+        ],
+    )
+    .await
+    .unwrap();
+    assert_eq!(p.actions[0].change, Change::Noop);
+    assert!(
+        matches!(
+            p.actions[1].change,
+            Change::Update {
+                id: 11,
+                prev_ttl: Some(1800),
+                ..
+            }
+        ),
+        "ttl fix: {p}"
+    );
+    assert_eq!(p.actions[2].change, Change::Create);
 }
 
 #[tokio::test]
-async fn do_plan_update_when_ip_or_ttl_differs() {
+async fn writes_expected_bodies() {
     let server = MockServer::start().await;
-    let recs = json!([ { "id": 42, "type":"A", "name":"www", "data":"2.2.2.2", "ttl": 120 } ]);
-    let resp = do_list_resp(recs, false);
-    Mock::given(method("GET"))
-        .and(path_regex("/v2/domains/.*/records"))
-        .and(query_param("type", "A"))
-        .and(query_param("name", "www"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(resp))
-        .mount(&server)
-        .await;
-    let cfg = AppConfig {
-        provider: Provider::Digitalocean,
-        account_id: None,
-        zone: "example.com".into(),
-        name: "www".into(),
-        ttl: 300,
-        sandbox: false,
-        api_base_url: Some(server.uri()),
-        schedule: Schedule {
-            calendar: None,
-            interval_secs: Some(300),
-        },
-    };
-    let token = SecretString::from("do_test_token".to_string());
-    let provider = build(&cfg, &token).unwrap();
-    let action = provider
-        .plan(&cfg, "1.2.3.4".parse().unwrap())
-        .await
-        .unwrap();
-    match action {
-        DnsAction::Update {
-            record_id,
-            ttl,
-            prev,
-        } => {
-            assert_eq!(record_id, 42);
-            assert_eq!(ttl, 300);
-            let want: Ipv4Addr = "2.2.2.2".parse::<Ipv4Addr>().unwrap();
-            assert_eq!(prev, want);
-        }
-        _ => panic!("expected Update"),
-    }
-}
-
-#[tokio::test]
-async fn do_plan_create_apex_uses_at_name() {
-    let server = MockServer::start().await;
-    let resp = do_list_resp(json!([]), false);
-    Mock::given(method("GET"))
-        .and(path_regex("/v2/domains/.*/records"))
-        .and(query_param("type", "A"))
-        .and(query_param("name", "@"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(resp))
-        .mount(&server)
-        .await;
-    let cfg = AppConfig {
-        provider: Provider::Digitalocean,
-        account_id: None,
-        zone: "example.com".into(),
-        name: "@".into(),
-        ttl: 300,
-        sandbox: false,
-        api_base_url: Some(server.uri()),
-        schedule: Schedule {
-            calendar: None,
-            interval_secs: Some(300),
-        },
-    };
-    let token = SecretString::from("do_test_token".to_string());
-    let provider = build(&cfg, &token).unwrap();
-    let action = provider
-        .plan(&cfg, "9.8.7.6".parse().unwrap())
-        .await
-        .unwrap();
-    match action {
-        DnsAction::Create { name, ttl } => {
-            assert_eq!(name, "@");
-            assert_eq!(ttl, 300);
-        }
-        _ => panic!("expected Create"),
-    }
-}
-
-#[tokio::test]
-async fn do_list_pagination_cap_exceeded() {
-    let server = MockServer::start().await;
-    // Pages 1..50 each return next=true and empty list
-    for p in 1..=50 {
-        let resp = do_list_resp(json!([]), true);
-        Mock::given(method("GET"))
-            .and(path_regex("/v2/domains/.*/records"))
-            .and(query_param("type", "A"))
-            .and(query_param("page", p.to_string()))
-            .respond_with(ResponseTemplate::new(200).set_body_json(resp))
-            .mount(&server)
-            .await;
-    }
-    let cfg = AppConfig {
-        provider: Provider::Digitalocean,
-        account_id: None,
-        zone: "example.com".into(),
-        name: "www".into(),
-        ttl: 300,
-        sandbox: false,
-        api_base_url: Some(server.uri()),
-        schedule: Schedule {
-            calendar: None,
-            interval_secs: Some(300),
-        },
-    };
-    let token = SecretString::from("do_test_token".to_string());
-    let provider = build(&cfg, &token).unwrap();
-    let err = provider
-        .plan(&cfg, "1.1.1.1".parse().unwrap())
-        .await
-        .err()
-        .unwrap();
-    assert!(format!("{err}").contains("pagination exceeded"));
-}
-
-#[tokio::test]
-async fn do_list_errors_fail_fast() {
-    for status in [401, 403, 429] {
-        let server = MockServer::start().await;
-        Mock::given(method("GET"))
-            .and(path_regex("/v2/domains/.*/records"))
-            .respond_with(ResponseTemplate::new(status))
-            .mount(&server)
-            .await;
-        let cfg = AppConfig {
-            provider: Provider::Digitalocean,
-            account_id: None,
-            zone: "example.com".into(),
-            name: "www".into(),
-            ttl: 300,
-            sandbox: false,
-            api_base_url: Some(server.uri()),
-            schedule: Schedule {
-                calendar: None,
-                interval_secs: Some(300),
-            },
-        };
-        let token = SecretString::from("do_test_token".to_string());
-        let provider = build(&cfg, &token).unwrap();
-        let err = provider
-            .plan(&cfg, "1.2.3.4".parse().unwrap())
-            .await
-            .err()
-            .unwrap();
-        assert!(format!("{err}").contains("digitalocean API: list error"));
-    }
-}
-
-#[tokio::test]
-async fn do_create_posts_expected_body_once() {
-    let server = MockServer::start().await;
-    // No existing records
-    let resp = do_list_resp(json!([]), false);
-    Mock::given(method("GET"))
-        .and(path_regex("/v2/domains/.*/records"))
-        .and(query_param("type", "A"))
-        .and(query_param("name", "www"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(resp))
-        .mount(&server)
-        .await;
-    // Expect POST with payload
-    let expected = json!({ "type":"A","name":"www","data":"1.2.3.4","ttl":300 });
-    Mock::given(method("POST"))
-        .and(path_regex("/v2/domains/.*/records$"))
-        .and(wiremock::matchers::body_json(expected))
-        .respond_with(ResponseTemplate::new(201).set_body_json(json!({"domain_record": {}})))
-        .expect(1)
-        .mount(&server)
-        .await;
-    let cfg = AppConfig {
-        provider: Provider::Digitalocean,
-        account_id: None,
-        zone: "example.com".into(),
-        name: "www".into(),
-        ttl: 300,
-        sandbox: false,
-        api_base_url: Some(server.uri()),
-        schedule: Schedule {
-            calendar: None,
-            interval_secs: Some(300),
-        },
-    };
-    let token = SecretString::from("do_test_token".to_string());
-    let provider = build(&cfg, &token).unwrap();
-    // Act: create via provider
-    provider
-        .create_a(&cfg, "www", "1.2.3.4".parse().unwrap(), 300)
-        .await
-        .unwrap();
-}
-
-#[tokio::test]
-async fn do_update_patches_expected_body_once() {
-    let server = MockServer::start().await;
-    let expected = json!({ "data":"5.6.7.8","ttl":300 });
+    list_mock(
+        &server,
+        "A",
+        json!([{"id": 11, "type": "A", "name": "@", "data": "9.9.9.9", "ttl": 300}]),
+    )
+    .await;
+    list_mock(
+        &server,
+        "TXT",
+        json!([{"id": 20, "type": "TXT", "name": "_dnsaddr", "data": "v=spf1 -all", "ttl": 300}]),
+    )
+    .await;
+    list_mock(&server, "AAAA", json!([])).await;
+    let txt = "dnsaddr=/dns6/example.com/tcp/4747/p2p/12D3KooWTest";
     Mock::given(method("PATCH"))
-        .and(path_regex("/v2/domains/.*/records/10$"))
-        .and(wiremock::matchers::body_json(expected))
+        .and(path("/v2/domains/example.com/records/11"))
+        .and(body_json(json!({"data": "1.2.3.4", "ttl": 300})))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({"domain_record": {}})))
         .expect(1)
         .mount(&server)
         .await;
-    let cfg = AppConfig {
-        provider: Provider::Digitalocean,
-        account_id: None,
-        zone: "example.com".into(),
-        name: "www".into(),
-        ttl: 300,
-        sandbox: false,
-        api_base_url: Some(server.uri()),
-        schedule: Schedule {
-            calendar: None,
-            interval_secs: Some(300),
-        },
-    };
-    let token = SecretString::from("do_test_token".to_string());
-    let provider = build(&cfg, &token).unwrap();
-    provider
-        .update_a(&cfg, 10, "5.6.7.8".parse().unwrap(), 300)
+    Mock::given(method("POST"))
+        .and(path("/v2/domains/example.com/records"))
+        .and(body_json(
+            json!({"type": "TXT", "name": "_dnsaddr", "data": txt, "ttl": 300}),
+        ))
+        .respond_with(ResponseTemplate::new(201).set_body_json(json!({"domain_record": {}})))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/v2/domains/example.com/records"))
+        .and(body_json(
+            json!({"type": "AAAA", "name": "@", "data": "2606:4700::1", "ttl": 300}),
+        ))
+        .respond_with(ResponseTemplate::new(201).set_body_json(json!({"domain_record": {}})))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let c = client(&server);
+    let want = [
+        Record::a("@", "1.2.3.4".parse().unwrap()),
+        Record::txt("_dnsaddr.example.com", txt), // the SPF record at the same name is left alone
+        Record::aaaa("", "2606:4700::1".parse().unwrap()),
+    ];
+    let p = plan(&c, "example.com.", &want).await.unwrap();
+    assert_eq!(apply(&c, &p).await.unwrap().len(), 3);
+}
+
+#[tokio::test]
+async fn typed_errors() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(query_param("type", "A"))
+        .respond_with(ResponseTemplate::new(401))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(query_param("type", "AAAA"))
+        .respond_with(ResponseTemplate::new(429).insert_header("Retry-After", "30"))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(query_param("type", "TXT"))
+        .respond_with(ResponseTemplate::new(500))
+        .mount(&server)
+        .await;
+    let c = client(&server);
+    let e = c
+        .list("example.com", "home", RecordKind::A)
         .await
-        .unwrap();
+        .unwrap_err();
+    assert!(matches!(e, Error::Auth { .. }), "{e:?}");
+    let e = c
+        .list("example.com", "home", RecordKind::Aaaa)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(e, Error::RateLimited { retry_after: Some(d), .. } if d == Duration::from_secs(30)),
+        "{e:?}"
+    );
+    let e = c
+        .list("example.com", "home", RecordKind::Txt)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(e, Error::Provider { .. }) && e.is_retryable(),
+        "{e:?}"
+    );
+    assert!(!format!("{e} {e:?}").contains("do_test_token"));
+
+    let dead = DigitalOceanProvider::new(
+        &SecretString::from("x".to_string()),
+        Some("http://127.0.0.1:9"),
+    )
+    .unwrap();
+    let e = dead
+        .list("example.com", "home", RecordKind::A)
+        .await
+        .unwrap_err();
+    assert!(matches!(e, Error::Network(_)), "{e:?}");
+    assert!(
+        !e.to_string().contains("127.0.0.1:9/v2"),
+        "no URL in message: {e}"
+    );
+}
+
+#[tokio::test]
+async fn pagination_cap() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(list(json!([]), true)))
+        .mount(&server)
+        .await;
+    let e = client(&server)
+        .list("example.com", "www", RecordKind::A)
+        .await
+        .unwrap_err();
+    assert!(e.to_string().contains("pagination exceeded"), "{e}");
 }

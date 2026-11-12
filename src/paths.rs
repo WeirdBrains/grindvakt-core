@@ -1,4 +1,4 @@
-//! Grindvakt's own default locations (feature `default-paths`).
+//! The standalone Grindvakt app's default locations (feature `standalone`).
 //!
 //! Embedding applications normally choose their own directory and pass explicit paths
 //! everywhere; these exist so the Grindvakt app and tools that read its files agree.
@@ -44,6 +44,7 @@ pub fn config_file(data_dir: &Path) -> PathBuf {
 }
 
 /// The vault file inside `data_dir`.
+#[cfg(feature = "vault")]
 pub fn vault_file(data_dir: &Path) -> PathBuf {
     data_dir.join(crate::vault::VAULT_FILE_NAME)
 }

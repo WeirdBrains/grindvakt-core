@@ -1,6 +1,10 @@
-//! Configuration: which provider, which record, which TTL and how often.
+//! Provider names, record-name helpers, and (feature `standalone`) the Grindvakt app's own
+//! config file.
 //!
-//! The on-disk form is the TOML that the Grindvakt app writes to `config.toml`:
+//! [`AppConfig`] is the TOML that the standalone Grindvakt app writes to `config.toml`.
+//! Embedding apps normally keep their own settings and call [`crate::plan()`] directly; the
+//! type is here so the Grindvakt app and tools that read its files (such as
+//! [`crate::standalone::find_conflicts`]) agree on the format:
 //!
 //! ```toml
 //! provider = "dnsimple"
@@ -14,19 +18,22 @@
 //! interval_secs = 300
 //! ```
 
-use crate::error::{Error, IoContext, Result};
+#[cfg(feature = "standalone")]
+use crate::error::IoContext;
+use crate::error::{Error, Result};
+#[cfg(feature = "standalone")]
 use crate::fs::{Privacy, atomic_write_private_with};
+pub use crate::record::{DEFAULT_TTL, MIN_TTL};
 use serde::{Deserialize, Serialize};
 use std::fmt;
+#[cfg(feature = "standalone")]
 use std::path::Path;
 use std::str::FromStr;
 
 /// File name the Grindvakt app uses for the config inside its data directory.
+#[cfg(feature = "standalone")]
+#[cfg_attr(docsrs, doc(cfg(feature = "standalone")))]
 pub const CONFIG_FILE_NAME: &str = "config.toml";
-/// Smallest TTL accepted, in seconds.
-pub const MIN_TTL: u32 = 60;
-/// TTL used when the config does not set one, in seconds.
-pub const DEFAULT_TTL: u32 = 300;
 
 /// A supported DNS provider.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
@@ -71,11 +78,13 @@ impl FromStr for Provider {
     }
 }
 
-/// When the updater runs: a calendar expression or a fixed interval (exactly one).
+#[cfg(feature = "standalone")]
+#[cfg_attr(docsrs, doc(cfg(feature = "standalone")))]
+/// When the standalone app runs: a calendar expression or a fixed interval. This crate only
+/// stores it; it has no scheduler.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Schedule {
-    /// A systemd `OnCalendar` expression. Portable timing ([`crate::schedule::next_wait`])
-    /// understands `hourly`, `daily` and `*:0/10`.
+    /// A systemd `OnCalendar` expression (interpreted by the Grindvakt app, not this crate).
     #[serde(default)]
     pub calendar: Option<String>,
     /// Polling interval in seconds (at least 60).
@@ -83,6 +92,7 @@ pub struct Schedule {
     pub interval_secs: Option<u64>,
 }
 
+#[cfg(feature = "standalone")]
 impl Default for Schedule {
     fn default() -> Self {
         Self {
@@ -92,7 +102,9 @@ impl Default for Schedule {
     }
 }
 
-/// The updater's configuration.
+#[cfg(feature = "standalone")]
+#[cfg_attr(docsrs, doc(cfg(feature = "standalone")))]
+/// The standalone Grindvakt app's configuration (`config.toml`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AppConfig {
     /// Active DNS provider.
@@ -119,10 +131,12 @@ pub struct AppConfig {
     pub schedule: Schedule,
 }
 
+#[cfg(feature = "standalone")]
 fn default_ttl() -> u32 {
     DEFAULT_TTL
 }
 
+#[cfg(feature = "standalone")]
 impl Default for AppConfig {
     fn default() -> Self {
         Self {
@@ -138,8 +152,10 @@ impl Default for AppConfig {
     }
 }
 
+#[cfg(feature = "standalone")]
 impl AppConfig {
-    /// Checks TTL, zone, name and that a schedule is set.
+    /// Checks TTL, zone, name, and that a schedule is set with an interval of at least 60 s.
+    /// (Calendar expressions are checked by the app that runs them.)
     pub fn validate(&self) -> Result<()> {
         if self.ttl < MIN_TTL {
             return Err(Error::Config(format!("ttl must be >= {MIN_TTL}")));
@@ -154,6 +170,12 @@ impl AppConfig {
             return Err(Error::Config(
                 "schedule must set either calendar or interval_secs".into(),
             ));
+        }
+        if !crate::record::is_valid_name(&self.zone, &self.name) {
+            return Err(Error::Config(format!(
+                "{:?} is not a valid record name",
+                self.name
+            )));
         }
         Ok(())
     }
@@ -207,9 +229,9 @@ impl AppConfig {
 pub fn normalize_fqdn(zone: &str, name: &str) -> String {
     let z = zone.trim_end_matches('.').to_string();
     let n = name.trim().trim_end_matches('.');
-    if n == "@" || n.is_empty() {
+    if n == "@" || n.is_empty() || n.eq_ignore_ascii_case(&z) {
         z
-    } else if n.ends_with(&z) {
+    } else if ends_with_zone(n, &z) {
         n.to_string()
     } else {
         format!("{}.", n) + &z
@@ -223,23 +245,29 @@ pub fn normalize_fqdn(zone: &str, name: &str) -> String {
 /// assert_eq!(relative_name("example.com", "@"), "");
 /// assert_eq!(relative_name("example.com", "home.example.com"), "home");
 /// assert_eq!(relative_name("example.com", "www"), "www");
+/// assert_eq!(relative_name("example.com", "notexample.com"), "notexample.com");
 /// ```
 pub fn relative_name(zone: &str, name: &str) -> String {
     let zone = zone.trim_end_matches('.').to_string();
     let name = name.trim().trim_end_matches('.');
-    if name == "@" || name.is_empty() || name == zone {
+    if name == "@" || name.is_empty() || name.eq_ignore_ascii_case(&zone) {
         String::new()
-    } else if name.ends_with(&zone) {
-        name.trim_end_matches('.')
-            .trim_end_matches(&zone)
-            .trim_end_matches('.')
-            .to_string()
+    } else if ends_with_zone(name, &zone) {
+        name[..name.len() - zone.len() - 1].to_string()
     } else {
         name.to_string()
     }
 }
 
-/// Input checks used when collecting a config interactively.
+/// `name` is `<something>.<zone>` (case-insensitive), not merely ending in the same letters.
+fn ends_with_zone(name: &str, zone: &str) -> bool {
+    name.len() > zone.len() + 1
+        && name.is_char_boundary(name.len() - zone.len())
+        && name.as_bytes()[name.len() - zone.len() - 1] == b'.'
+        && name[name.len() - zone.len()..].eq_ignore_ascii_case(zone)
+}
+
+/// Input checks for domains and record names.
 pub mod validate {
     use regex::Regex;
     use std::sync::LazyLock;
@@ -269,6 +297,8 @@ pub mod validate {
     }
 
     /// `@`, relative labels such as `www` or `home.office`, or a full name inside `zone`.
+    /// Stricter than [`crate::record::is_valid_name`] (no `_`, labels of two or more
+    /// characters); kept for the Grindvakt app's interactive setup.
     pub fn is_valid_record_name(zone: &str, name: &str) -> bool {
         let n = name.trim();
         if n == "@" {
@@ -280,12 +310,5 @@ pub mod validate {
             return true;
         }
         is_valid_fqdn(n) && n.ends_with(zone.trim_end_matches('.'))
-    }
-
-    /// The cheap calendar check used when `systemd-analyze` is not available: not empty,
-    /// no newline, no `%`, at most 256 bytes.
-    pub fn calendar_is_plausible(expr: &str) -> bool {
-        let t = expr.trim();
-        !t.is_empty() && !t.contains('\n') && !t.contains('%') && t.len() <= 256
     }
 }
