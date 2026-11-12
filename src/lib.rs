@@ -1,9 +1,10 @@
 //! # grindvakt-core
 //!
 //! The engine of [Grindvakt](https://grindvakt.weirdbrains.com/), the dynamic DNS updater,
-//! as a library you embed. It keeps **A, AAAA and TXT** records on **DNSimple** or
+//! as a library you embed. It keeps **A, AAAA, TXT and CNAME** records on **DNSimple** or
 //! **DigitalOcean** pointed at where your machine is, including the libp2p
-//! `_dnsaddr` TXT record a peer-to-peer node publishes:
+//! `_dnsaddr` TXT record a peer-to-peer node publishes and aliases such as `www`
+//! ([`record::Record::cname`]):
 //!
 //! 1. [`ip::discover`] finds your public IPv4 and IPv6 addresses separately, from several
 //!    HTTPS sources that must agree, and says [`Error::NoGlobalAddress`] when there is

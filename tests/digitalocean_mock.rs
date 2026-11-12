@@ -44,6 +44,7 @@ async fn noop_update_and_apex() {
         ]),
     )
     .await;
+    list_mock(&server, "CNAME", json!([])).await;
     let c = client(&server);
     let ip = "1.2.3.4".parse().unwrap();
     let p = plan(
@@ -88,6 +89,7 @@ async fn writes_expected_bodies() {
     )
     .await;
     list_mock(&server, "AAAA", json!([])).await;
+    list_mock(&server, "CNAME", json!([])).await;
     let txt = "dnsaddr=/dns6/example.com/tcp/4747/p2p/12D3KooWTest";
     Mock::given(method("PATCH"))
         .and(path("/v2/domains/example.com/records/11"))
@@ -122,6 +124,85 @@ async fn writes_expected_bodies() {
     ];
     let p = plan(&c, "example.com.", &want).await.unwrap();
     assert_eq!(apply(&c, &p).await.unwrap().len(), 3);
+}
+
+#[tokio::test]
+async fn cname_wants_a_trailing_dot_and_reads_relative_data() {
+    let server = MockServer::start().await;
+    list_mock(
+        &server,
+        "CNAME",
+        json!([
+            {"id": 30, "type": "CNAME", "name": "www", "data": "home.example.com.", "ttl": 300},
+            {"id": 31, "type": "CNAME", "name": "blog", "data": "home", "ttl": 300},
+            {"id": 32, "type": "CNAME", "name": "apex", "data": "@", "ttl": 300},
+        ]),
+    )
+    .await;
+    // Any-type listing for the exclusivity check: "mail" has an MX record.
+    Mock::given(method("GET"))
+        .and(path("/v2/domains/example.com/records"))
+        .and(wiremock::matchers::query_param_is_missing("type"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(list(
+            json!([
+                {"id": 30, "type": "CNAME", "name": "www", "data": "home.example.com.", "ttl": 300},
+                {"id": 40, "type": "MX", "name": "mail", "data": "mx.example.net.", "ttl": 300},
+            ]),
+            false,
+        )))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/v2/domains/example.com/records"))
+        .and(body_json(
+            json!({"type": "CNAME", "name": "docs", "data": "pages.example.net.", "ttl": 300}),
+        ))
+        .respond_with(ResponseTemplate::new(201).set_body_json(json!({"domain_record": {}})))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("PATCH"))
+        .and(path("/v2/domains/example.com/records/32"))
+        .and(body_json(json!({"data": "home.example.com.", "ttl": 300})))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"domain_record": {}})))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let c = client(&server);
+    let p = plan(
+        &c,
+        "example.com",
+        &[
+            Record::cname("www", "home.example.com"),
+            Record::cname("blog", "home.example.com."),
+            Record::cname("docs", "Pages.Example.net"),
+            Record::cname("apex", "home.example.com"),
+        ],
+    )
+    .await
+    .unwrap();
+    assert_eq!(p.actions[0].change, Change::Noop, "{p}");
+    assert_eq!(p.actions[1].change, Change::Noop, "relative data: {p}");
+    assert_eq!(p.actions[2].change, Change::Create, "{p}");
+    assert!(
+        matches!(p.actions[3].change, Change::Update { id: 32, .. }),
+        "{p}"
+    );
+    assert_eq!(apply(&c, &p).await.unwrap().len(), 2);
+
+    let p = plan(
+        &c,
+        "example.com",
+        &[Record::cname("mail", "home.example.com")],
+    )
+    .await
+    .unwrap();
+    assert!(
+        matches!(&p.actions[0].change, Change::Ambiguous { reason } if reason.contains("MX")),
+        "{p}"
+    );
+    let types = c.types_at("example.com", "mail").await.unwrap();
+    assert_eq!(types, ["MX"]);
 }
 
 #[tokio::test]

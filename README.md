@@ -5,14 +5,14 @@
 [![CI](https://github.com/WeirdBrains/grindvakt-core/actions/workflows/ci.yml/badge.svg)](https://github.com/WeirdBrains/grindvakt-core/actions/workflows/ci.yml)
 
 **The engine of [Grindvakt](https://grindvakt.weirdbrains.com/), the dynamic DNS updater,
-as a library.** It keeps **A, AAAA and TXT** records on **DNSimple** or **DigitalOcean**
-pointed at where your machine is, including the libp2p `_dnsaddr` TXT record a
-peer-to-peer node publishes. Use it to add "keep my name pointed at me" to your own
+as a library.** It keeps **A, AAAA, TXT and CNAME** records on **DNSimple** or
+**DigitalOcean** pointed at where your machine is, including the libp2p `_dnsaddr` TXT
+record a peer-to-peer node publishes and aliases such as `www` → `home`. Use it to add "keep my name pointed at me" to your own
 program (a browser, a home server dashboard, a node) without running the Grindvakt service.
 
 ```toml
 [dependencies]
-grindvakt-core = "1.0.0"
+grindvakt-core = "1.1.0"
 ```
 
 ## What it does
@@ -31,7 +31,18 @@ grindvakt-core = "1.0.0"
 
 TXT records are matched by their key (the text up to `=`, such as `dnsaddr=`), so your
 `_dnsaddr` records never touch an SPF or site-verification record at the same name.
-Nothing is ever deleted.
+A name has at most one CNAME, which is kept, retargeted or created:
+
+```rust
+use grindvakt_core::record::Record;
+let alias = Record::cname("www", "home.example.com"); // trailing dot optional
+```
+
+A CNAME must be alone at its name, so the plan is `Ambiguous` (and `apply` refuses it)
+when a CNAME is wanted where other records exist (any type, `MX` included), when an
+A/AAAA/TXT record is wanted where a CNAME exists, or when one plan asks for both. CNAMEs
+cannot sit at the zone apex, and targets must be full host names. DigitalOcean gets the
+trailing dot it requires; DNSimple gets the bare name. Nothing is ever deleted.
 
 ## What the caller owns
 
@@ -157,7 +168,7 @@ All of these run offline; the provider examples start a local mock API.
 | example | shows |
 |---|---|
 | `embed_in_app` | a browser-like host: token from its keyring, addresses from its network stack, a dry-run preview, apply, typed errors for the UI, falling back to relays on CGNAT |
-| `dns_plan_dry_run` | A, AAAA and `_dnsaddr` TXT planned against a DNSimple mock, leaving an SPF record alone |
+| `dns_plan_dry_run` | A, AAAA, `_dnsaddr` TXT and a `www` CNAME planned against a DNSimple mock, leaving an SPF record alone and refusing a CNAME beside an MX record |
 | `ip_discovery` | IPv4/IPv6 discovery, majority voting, `NoGlobalAddress` (`-- --live` asks the real sources) |
 | `vault_roundtrip` | create a vault, unlock by password and by recovery words, reset the password, add a token |
 | `config_load` | load, validate, edit and atomically save the standalone `config.toml` |
