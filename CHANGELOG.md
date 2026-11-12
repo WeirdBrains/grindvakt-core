@@ -4,6 +4,13 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and versions match Grindvakt app
 releases one for one.
 
+## [1.1.3] - 2026-11-12
+
+### Changed
+
+- No library or API changes. Released to keep the version in lockstep with Grindvakt 1.1.3,
+  whose macOS installer is now Apple Silicon only.
+
 ## [1.1.2] - 2026-11-12
 
 ### Changed
