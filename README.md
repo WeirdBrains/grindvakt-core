@@ -220,7 +220,8 @@ Linux, macOS, Windows, Android and iOS. Rust **1.99** or newer, edition 2024.
 
 `grindvakt-core` is versioned **in lockstep with the Grindvakt app**: crate X.Y.Z is exactly
 the library inside Grindvakt vX.Y.Z. Every Grindvakt release publishes `grindvakt-core` X.Y.Z
-to crates.io first, and the app's release script refuses to tag vX.Y.Z until that version is
+to crates.io first (both repos release with the shared WeirdBrains script,
+`scripts/weirdnet_release.py`), and the app's release refuses to tag vX.Y.Z until that version is
 live on crates.io and the app depends on `=X.Y.Z`. Semver applies to this crate's public API;
 because of the lockstep, a minor or patch version may contain no library changes. The vault
 and config formats are stable; changing them would take a major version and a migration path.

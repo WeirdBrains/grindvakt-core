@@ -4,6 +4,13 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and versions match Grindvakt app
 releases one for one.
 
+## [Unreleased]
+
+### Changed
+
+- Releases use the shared WeirdBrains release script (`scripts/weirdnet_release.py` with
+  `release.toml`) instead of `scripts/release.py`; the gates and the crates.io publish are the same.
+
 ## [1.1.4] - 2026-11-12
 
 ### Changed
