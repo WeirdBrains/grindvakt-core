@@ -1,0 +1,91 @@
+[package]
+name = "grindvakt-core"
+version = "1.0.0"
+edition = "2024"
+rust-version = "1.99"
+description = "The engine behind the Grindvakt dynamic DNS updater as a library: keep an A record pointed at your public IPv4 on DNSimple or DigitalOcean. Includes a strict-majority public IP lookup, idempotent plan/apply sync, an encrypted token vault (Argon2id password and 24-word recovery, XChaCha20-Poly1305), TOML config, schedule timing and private file writes. It has no OS service code and no prompts."
+license = "BSD-3-Clause"
+authors = ["Michael Christenson II <m3talsmith@gmail.com>"]
+repository = "https://github.com/WeirdBrains/grindvakt-core"
+homepage = "https://grindvakt.weirdbrains.com/"
+documentation = "https://docs.rs/grindvakt-core"
+readme = "README.md"
+keywords = ["dns", "ddns", "dnsimple", "digitalocean", "dynamic-dns"]
+categories = ["network-programming", "cryptography", "api-bindings"]
+include = [
+  "/src/**/*.rs",
+  "/examples/**/*.rs",
+  "/tests/**/*.rs",
+  "/tests/fixtures/**",
+  "/README.md",
+  "/LICENSE",
+  "/CHANGELOG.md",
+  "/Cargo.toml",
+]
+
+[package.metadata.docs.rs]
+all-features = true
+targets = ["x86_64-unknown-linux-gnu", "x86_64-apple-darwin", "aarch64-apple-darwin", "x86_64-pc-windows-msvc"]
+rustdoc-args = ["--cfg", "docsrs"]
+
+[features]
+default = ["dnsimple", "digitalocean", "public-ip"]
+## DNSimple provider (official `dnsimple` crate).
+dnsimple = ["dep:dnsimple", "dep:tokio"]
+## DigitalOcean provider (REST over reqwest + rustls).
+digitalocean = ["dep:reqwest", "dep:tokio"]
+## Public IPv4 lookup over HTTPS echo services.
+public-ip = ["dep:reqwest", "dep:futures-util"]
+## Grindvakt's own default locations (~/.grindvakt, %PROGRAMDATA%\Grindvakt, lock dirs).
+default-paths = ["dep:directories"]
+
+[dependencies]
+base64 = "0.21"
+chrono = { version = "0.4", default-features = false, features = ["std", "clock"] }
+fs2 = "0.4"
+regex = "1.10"
+secrecy = "0.10"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+thiserror = "2"
+toml = "0.8"
+weirdnet-keys = { version = "0.1", default-features = false }
+weirdnet-rules = "0.1"
+zeroize = "1.7"
+directories = { version = "5.0", optional = true }
+dnsimple = { version = "8.0.0", optional = true }
+futures-util = { version = "0.3", default-features = false, features = ["alloc"], optional = true }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"], optional = true }
+tokio = { version = "1.41", features = ["time"], optional = true }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+tempfile = "3.10"
+
+[target.'cfg(windows)'.dependencies]
+uuid = { version = "1.10", features = ["v4"] }
+widestring = "1.1"
+windows = { version = "0.58", features = [
+  "Win32_Foundation",
+  "Win32_Security",
+  "Win32_Security_Authorization",
+  "Win32_Storage_FileSystem",
+] }
+
+[dev-dependencies]
+assert_fs = "1.1"
+serial_test = "3.1"
+tempfile = "3.10"
+tokio = { version = "1.41", features = ["rt-multi-thread", "macros", "time", "sync"] }
+wiremock = "0.6"
+
+[[example]]
+name = "dns_sync_dry_run"
+required-features = ["dnsimple"]
+
+[[example]]
+name = "embed_in_app"
+required-features = ["digitalocean"]
+
+[[example]]
+name = "ip_consensus"

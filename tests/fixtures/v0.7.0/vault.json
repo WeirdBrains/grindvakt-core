@@ -1,0 +1,15 @@
+{
+  "version": 1,
+  "kdf": {
+    "mem_mib": 64,
+    "iterations": 3,
+    "parallelism": 1
+  },
+  "salt_password": "BDEuRn8480z8O6lATNVs2A==",
+  "salt_recovery": "0R1hxoroRRlh9HFMBtaYBg==",
+  "dek_wrapped_by_password": "qqhb/WMEsgHcUxSn9DEDxXezDKzCCEPZC2HIZAyF6lp+CdBAKtn+Wa6amxj7Xnsi8gbh6MO6ojh5gVcyePU9YXqC1eEF+2B0",
+  "dek_wrapped_by_recovery": "oxDpOGksWUlFeGTK1R7HkPVQF8fwMH1GKv38L4+9Wsi2FlGD/KZ3NWhYFcOw/t5vfUhtRsZSICZvdaaDIQvVlnAkUiKir8z2",
+  "secrets_aead_nonce": "7oIaI+lRNqXBc74s14Dq38LWj0cooC5I",
+  "secrets_aead_ciphertext": "GX6aR1G9FviHJzpU3xjvI2ZH0xa2jqd5m7jij+3JJUN8NZOU4siQoxeqFppv7RmBfDZflyL5aaKV6qcuuQDDGtlsSn2hykGl0IYRAEGvSvu3psHYprfjQ+H0UqIBt2kG7PwpUpqmjw==",
+  "created_unix": 1762900000
+}
