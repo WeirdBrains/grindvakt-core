@@ -87,7 +87,7 @@ async fn sync(dns: &DigitalOceanProvider, addrs: &[IpAddr], dry_run: bool) -> Dd
 async fn main() -> grindvakt_core::Result<()> {
     // A DigitalOcean look-alike with an empty zone, accepting creates.
     let server = MockServer::start().await;
-    for kind in ["A", "AAAA", "TXT"] {
+    for kind in ["A", "AAAA", "TXT", "CNAME"] {
         Mock::given(method("GET"))
             .and(path("/v2/domains/example.org/records"))
             .and(query_param("type", kind))
