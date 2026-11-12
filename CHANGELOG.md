@@ -4,6 +4,13 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and versions match Grindvakt app
 releases one for one.
 
+## [1.1.1] - 2026-11-11
+
+### Changed
+
+- No library or API changes. Released to keep the version in lockstep with Grindvakt 1.1.1,
+  which is now BSD-3-Clause and public like this crate.
+
 ## [1.1.0] - 2026-11-11
 
 ### Added
