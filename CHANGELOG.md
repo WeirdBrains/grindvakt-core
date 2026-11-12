@@ -4,6 +4,14 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and versions match Grindvakt app
 releases one for one.
 
+## [1.1.4] - 2026-11-12
+
+### Changed
+
+- No library or API changes. Released to keep the version in lockstep with Grindvakt 1.1.4,
+  which fixes its Windows service install. CI pins actions/checkout 7.0.1 by SHA, installs Rust
+  with rustup and runs with a read-only token.
+
 ## [1.1.3] - 2026-11-12
 
 ### Changed
