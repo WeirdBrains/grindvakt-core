@@ -38,6 +38,8 @@ digitalocean = ["dep:reqwest", "dep:tokio"]
 public-ip = ["dep:reqwest", "dep:futures-util", "dep:tokio", "tokio/net"]
 ## Encrypted token vault (Argon2id + 24-word recovery, XChaCha20-Poly1305 via weirdnet-keys).
 vault = ["dep:weirdnet-keys", "dep:base64", "dep:zeroize", "dep:chrono"]
+## CNAME content from a Weirdnet resource link (`weirdnet-<app>://<name>/<path>`), parsed by weirdnet-schemes.
+weirdnet = ["dep:weirdnet-schemes"]
 ## The standalone Grindvakt app's config file, default paths, single-A sync and conflict detection.
 standalone = ["dep:toml", "dep:directories"]
 
@@ -57,6 +59,7 @@ reqwest = { version = "0.13", default-features = false, features = ["rustls", "j
 tokio = { version = "1.41", features = ["time"], optional = true }
 toml = { version = "0.8", optional = true }
 weirdnet-keys = { version = "0.1", default-features = false, optional = true }
+weirdnet-schemes = { version = "0.1", optional = true }
 zeroize = { version = "1.7", optional = true }
 
 [target.'cfg(unix)'.dependencies]
