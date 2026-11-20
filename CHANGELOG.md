@@ -6,6 +6,8 @@ releases one for one.
 
 ## [Unreleased]
 
+## [1.3.0] - 2026-11-20
+
 ### Added
 
 - Feature `weirdnet` (off by default): a Weirdnet resource link
