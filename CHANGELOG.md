@@ -6,6 +6,18 @@ releases one for one.
 
 ## [Unreleased]
 
+### Added
+
+- Feature `weirdnet` (off by default): a Weirdnet resource link
+  (`weirdnet-<app>://<name>/<path>`, parsed by weirdnet-schemes) can be a CNAME's content; its
+  name is the target. Invitation links, user ids, IP addresses and the bare `weirdnet://` scheme
+  are refused.
+- `cname::CnameSource` (fixed target or Weirdnet link) and `cname::weirdnet_link_target`.
+- `config::RecordType`, `config::CnameConfig` and `AppConfig` fields `record` (default `a`) and
+  `cname`: `record = "cname"` with a `[cname]` table holding exactly one of `target` or
+  `weirdnet_link`. Existing configs are unchanged.
+- `sync::sync_cname_once` and `sync::CnameOutcome`: plan and apply the config's CNAME.
+
 ## [1.2.0] - 2026-11-12
 
 ### Added

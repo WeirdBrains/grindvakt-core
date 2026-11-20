@@ -17,6 +17,21 @@
 //! [schedule]
 //! interval_secs = 300
 //! ```
+//!
+//! The record is an `A` record by default. `record = "cname"` makes it a `CNAME` instead, with
+//! its content from a `[cname]` table: exactly one of `target` (a host name) or
+//! `weirdnet_link` (a `weirdnet-<app>://<name>/<path>` link whose name becomes the target,
+//! needs feature `weirdnet`):
+//!
+//! ```toml
+//! provider = "digitalocean"
+//! zone = "example.net"
+//! name = "www"
+//! record = "cname"
+//!
+//! [cname]
+//! weirdnet_link = "weirdnet-morph://home.example.com/site"
+//! ```
 
 #[cfg(feature = "standalone")]
 use crate::error::IoContext;
@@ -104,6 +119,83 @@ impl Default for Schedule {
 
 #[cfg(feature = "standalone")]
 #[cfg_attr(docsrs, doc(cfg(feature = "standalone")))]
+/// Which kind of record the standalone app keeps current.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum RecordType {
+    /// An `A` record holding this machine's public IPv4 address.
+    #[default]
+    A,
+    /// A `CNAME` record whose content comes from [`AppConfig::cname`].
+    Cname,
+}
+
+#[cfg(feature = "standalone")]
+impl RecordType {
+    /// The lowercase name used in config files and on the command line.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            RecordType::A => "a",
+            RecordType::Cname => "cname",
+        }
+    }
+}
+
+#[cfg(feature = "standalone")]
+impl fmt::Display for RecordType {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+#[cfg(feature = "standalone")]
+impl FromStr for RecordType {
+    type Err = Error;
+    fn from_str(s: &str) -> Result<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "a" => Ok(RecordType::A),
+            "cname" => Ok(RecordType::Cname),
+            other => Err(Error::Config(format!(
+                "unsupported record type {other:?}; choose a or cname"
+            ))),
+        }
+    }
+}
+
+#[cfg(feature = "standalone")]
+#[cfg_attr(docsrs, doc(cfg(feature = "standalone")))]
+/// The `[cname]` table: where a `CNAME` record's content comes from. Set exactly one field.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CnameConfig {
+    /// A full host name to point at, such as `home.example.com`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target: Option<String>,
+    /// A Weirdnet resource link, `weirdnet-<app>://<name>/<path>`; the name is the target.
+    /// Needs feature `weirdnet`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub weirdnet_link: Option<String>,
+}
+
+#[cfg(feature = "standalone")]
+impl CnameConfig {
+    /// The content source, or an [`Error::Config`] unless exactly one field is set.
+    pub fn source(&self) -> Result<crate::cname::CnameSource> {
+        match (&self.target, &self.weirdnet_link) {
+            (Some(t), None) => Ok(crate::cname::CnameSource::Target(t.clone())),
+            (None, Some(l)) => Ok(crate::cname::CnameSource::WeirdnetLink(l.clone())),
+            (None, None) => Err(Error::Config(
+                "[cname] needs one of target or weirdnet_link".into(),
+            )),
+            (Some(_), Some(_)) => Err(Error::Config(
+                "[cname] takes either target or weirdnet_link, not both".into(),
+            )),
+        }
+    }
+}
+
+#[cfg(feature = "standalone")]
+#[cfg_attr(docsrs, doc(cfg(feature = "standalone")))]
 /// The standalone Grindvakt app's configuration (`config.toml`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AppConfig {
@@ -117,6 +209,12 @@ pub struct AppConfig {
     pub zone: String,
     /// Record name: `@` for the apex, a relative label such as `www`, or a full name.
     pub name: String,
+    /// The kind of record to keep: `a` (the default) or `cname`.
+    #[serde(default, skip_serializing_if = "is_default_record")]
+    pub record: RecordType,
+    /// Content of the `CNAME` record; required for, and only allowed with, `record = "cname"`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cname: Option<CnameConfig>,
     /// TTL in seconds (at least [`MIN_TTL`]).
     #[serde(default = "default_ttl")]
     pub ttl: u32,
@@ -132,6 +230,11 @@ pub struct AppConfig {
 }
 
 #[cfg(feature = "standalone")]
+fn is_default_record(r: &RecordType) -> bool {
+    *r == RecordType::A
+}
+
+#[cfg(feature = "standalone")]
 fn default_ttl() -> u32 {
     DEFAULT_TTL
 }
@@ -144,6 +247,8 @@ impl Default for AppConfig {
             account_id: None,
             zone: "example.com".to_string(),
             name: "@".to_string(),
+            record: RecordType::A,
+            cname: None,
             ttl: DEFAULT_TTL,
             sandbox: false,
             api_base_url: None,
@@ -176,6 +281,32 @@ impl AppConfig {
                 "{:?} is not a valid record name",
                 self.name
             )));
+        }
+        match (self.record, &self.cname) {
+            (RecordType::A, Some(_)) => {
+                return Err(Error::Config(
+                    "[cname] is only used with record = \"cname\"".into(),
+                ));
+            }
+            (RecordType::A, None) => {}
+            (RecordType::Cname, None) => {
+                return Err(Error::Config(
+                    "record = \"cname\" needs a [cname] table with target or weirdnet_link".into(),
+                ));
+            }
+            (RecordType::Cname, Some(c)) => {
+                if self
+                    .record_fqdn()
+                    .eq_ignore_ascii_case(self.zone.trim_end_matches('.'))
+                {
+                    return Err(Error::Config(
+                        "a CNAME cannot be at the zone apex; set a name such as www".into(),
+                    ));
+                }
+                c.source()?
+                    .target()
+                    .map_err(|e| Error::Config(e.to_string()))?;
+            }
         }
         Ok(())
     }

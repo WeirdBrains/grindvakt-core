@@ -159,7 +159,47 @@ An app that manages `home.example.com` must not fight a standalone Grindvakt tha
 same name. `standalone::find_conflicts(&["home.example.com"])` reads the standalone app's
 config from its default location and reports installs that would conflict. The same feature
 holds the standalone app's own `config.toml` model (`config::AppConfig`), default paths, and
-its single-A-record `sync::sync_once`.
+its single-record `sync::sync_once` (an A record) and `sync::sync_cname_once` (a CNAME).
+
+### CNAME content from a Weirdnet link (feature `weirdnet`)
+
+A CNAME's content is a `cname::CnameSource`: a fixed target name, or a Weirdnet resource link
+`weirdnet-<app>://<name>/<path>` whose name becomes the target. The link is parsed by
+[`weirdnet-schemes`](https://crates.io/crates/weirdnet-schemes) (`Link::parse`); this crate only
+decides what it accepts: a resource link on a first-party `weirdnet-<app>` scheme whose name is
+a full DNS host name. Invitation links (`join/`, `answer/`), user ids and other names without a
+dot, IP addresses, ports, credentials, the bare `weirdnet://` scheme and other apps' schemes are
+refused, and an error never repeats an invitation code. Nothing is looked up: the target comes
+from the link text alone.
+
+```rust
+use grindvakt_core::cname::{CnameSource, weirdnet_link_target};
+use grindvakt_core::record::Record;
+
+let link = "weirdnet-morph://Home.Example.com/notes/a.md";
+assert_eq!(weirdnet_link_target(link)?, "home.example.com");
+assert!(weirdnet_link_target("weirdnet-morph://join/CODE").is_err());
+
+let target = CnameSource::WeirdnetLink(link.into()).target()?;
+let alias = Record::cname("www", target);
+# Ok::<(), grindvakt_core::Error>(())
+```
+
+The standalone `config.toml` takes it as `record = "cname"` and a `[cname]` table with exactly
+one of `target` or `weirdnet_link`. `record` defaults to `"a"`, so existing configs are
+unchanged. Without the feature, a config with `weirdnet_link` is refused with a clear error.
+
+```toml
+zone = "example.net"
+name = "www"
+record = "cname"
+
+[cname]
+weirdnet_link = "weirdnet-morph://home.example.com/site"
+```
+
+Each pass resolves the content again, so changing the link retargets the record. The CNAME
+rules above still apply (not at the apex, alone at its name, nothing is deleted).
 
 ## Examples
 
@@ -186,6 +226,7 @@ cargo run --example embed_in_app
 | `public-ip` | yes | `ip::discover` (reqwest, rustls) |
 | `vault` | no | `vault`: encrypted token file with password and recovery phrase |
 | `standalone` | no | `config::AppConfig`, `paths`, `sync`, `standalone::find_conflicts`, `lock::SingleInstanceLock::acquire` |
+| `weirdnet` | no | `cname::weirdnet_link_target`, and Weirdnet links as `CnameSource` and `[cname] weirdnet_link` (weirdnet-schemes) |
 
 `default-features = false` has **no network code**: records, the planner, the provider trait,
 the address rules, private file writes and the lock. The network features need a Tokio

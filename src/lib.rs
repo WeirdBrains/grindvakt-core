@@ -83,6 +83,7 @@
 #![deny(missing_docs)]
 #![warn(rust_2018_idioms)]
 
+pub mod cname;
 pub mod config;
 mod error;
 pub mod fs;
@@ -120,7 +121,8 @@ pub use weirdnet_keys;
     feature = "digitalocean",
     feature = "public-ip",
     feature = "vault",
-    feature = "standalone"
+    feature = "standalone",
+    feature = "weirdnet"
 ))]
 #[doc = include_str!("../README.md")]
 pub struct ReadmeDoctests;
