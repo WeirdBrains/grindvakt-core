@@ -43,7 +43,7 @@ jobs:
       - name: each feature alone
         shell: bash
         run: |
-          for f in dnsimple digitalocean public-ip vault standalone; do
+          for f in dnsimple digitalocean public-ip vault standalone weirdnet; do
             cargo clippy --all-targets --no-default-features --features "$f" --locked -- -D warnings
           done
       - name: examples
